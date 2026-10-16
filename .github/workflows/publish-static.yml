@@ -7,7 +7,7 @@ env:
   DOCKER_BUILD_RECORD_UPLOAD: 'false'
 jobs:
   publish:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(inputs.runner) }}
     timeout-minutes: 20
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -50,8 +50,8 @@ jobs:
       env:
         IMAGE: ghcr.io/${{ github.repository_owner }}/${{ inputs.image }}@${{ steps.build.outputs.digest }}
       run: |
-        docker pull "$IMAGE"
-        docker run --name acceptance --detach --publish 127.0.0.1:18080:80 "$IMAGE"
+        docker pull --platform linux/amd64 "$IMAGE"
+        docker run --platform linux/amd64 --name acceptance --detach --publish 127.0.0.1:18080:80 "$IMAGE"
         trap 'docker rm -f acceptance' EXIT
         for _ in {1..30}; do
           if curl --fail --silent http://127.0.0.1:18080/ --output /tmp/response.html; then break; fi
@@ -68,7 +68,7 @@ jobs:
         docker run --rm --user 65532:65532 --cap-drop ALL --security-opt no-new-privileges \
           --env TRIVY_USERNAME --env TRIVY_PASSWORD \
           ghcr.io/aquasecurity/trivy:0.76.0@sha256:2416d1f74045b57274df1a340eee6b510cacd73c66a6ccb8da092b117eb7d222 image \
-          --cache-dir /tmp/trivy --image-src remote --scanners vuln \
+          --cache-dir /tmp/trivy --image-src remote --platform linux/amd64 --scanners vuln \
           --disable-telemetry --skip-version-check \
           --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --timeout 15m "$SCAN_IMAGE"
     - name: Promote verified release
@@ -85,6 +85,10 @@ jobs:
 'on':
   workflow_call:
     inputs:
+      runner:
+        description: Runner labels as a JSON array
+        type: string
+        default: '["ubuntu-24.04"]'
       artifact:
         type: string
         required: true
