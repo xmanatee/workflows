@@ -59,17 +59,17 @@ jobs:
         cmp image/site/index.html /tmp/response.html
         docker exec acceptance nginx -t
     - name: Scan the exact runtime image
-      uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
-      with:
-        version: v0.76.0
-        scanners: vuln
-        image-ref: ghcr.io/${{ github.repository_owner }}/${{ inputs.image }}@${{ steps.build.outputs.digest }}
-        severity: HIGH,CRITICAL
-        ignore-unfixed: true
-        exit-code: '1'
       env:
+        SCAN_IMAGE: ghcr.io/${{ github.repository_owner }}/${{ inputs.image }}@${{ steps.build.outputs.digest }}
         TRIVY_USERNAME: ${{ github.actor }}
         TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        docker run --rm --user 65532:65532 --cap-drop ALL --security-opt no-new-privileges \
+          --env TRIVY_USERNAME --env TRIVY_PASSWORD \
+          ghcr.io/aquasecurity/trivy:0.76.0@sha256:2416d1f74045b57274df1a340eee6b510cacd73c66a6ccb8da092b117eb7d222 image \
+          --cache-dir /tmp/trivy --image-src remote --scanners vuln \
+          --disable-telemetry --skip-version-check \
+          --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --timeout 15m "$SCAN_IMAGE"
     - name: Promote verified release
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
