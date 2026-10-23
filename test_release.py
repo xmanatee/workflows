@@ -33,6 +33,25 @@ class FakeGitHub:
 
 
 class PublicationTests(unittest.TestCase):
+    def test_verified_site_can_contain_its_own_verified_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            (output / 'site').mkdir()
+            page = output / 'site/verified.json'
+            page.write_text('{"public":true}\n')
+            config = {'image': 'ghcr.io/owner/app'}
+            record = {'repository': 'owner/app', 'revision': 'a' * 40, 'config': config,
+                      'policy': release.POLICY, 'files': {'site/verified.json': release.digest(page)}}
+            (output / 'verified.json').write_text(json.dumps(record))
+            self.assertEqual(release.validate_artifact('owner/app', 'a' * 40, config, output), record)
+            page.write_text('{"public":false}\n')
+            with self.assertRaisesRegex(ValueError, 'modified'):
+                release.validate_artifact('owner/app', 'a' * 40, config, output)
+            page.write_text('{"public":true}\n')
+            (output / 'site/extra.txt').write_text('unverified')
+            with self.assertRaisesRegex(ValueError, 'inventory changed'):
+                release.validate_artifact('owner/app', 'a' * 40, config, output)
+
     def test_public_packages_are_rejected_before_upload(self):
         gh = FakeGitHub()
         with patch.object(gh, 'api', return_value={'visibility': 'public'}):

@@ -6,6 +6,7 @@ Release. Ansible consumes the existing `release.json` and image digest as before
 Uncommitted work never enters a release. No GitHub Actions minutes are required.
 With the project's pinned Node and package manager selected, `npm run deploy` or
 `pnpm run deploy` calls the same publisher.
+`python3 .release/deploy.py status` reports whether the committed revision is published.
 
 Requirements: Python 3.12+, GitHub CLI authenticated with repository and package
 publishing access, Docker/Buildx, and the Node version in the app's `.nvmrc`.

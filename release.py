@@ -352,7 +352,7 @@ def should_promote(revision, current_main):
     return revision == current_main
 
 
-def publish(gh, repository, revision, config, output, qualifier):
+def validate_artifact(repository, revision, config, output):
     record = json.loads((output / 'verified.json').read_text())
     if (record['repository'], record['revision'], record['config'], record['policy']) != (
             repository, revision, config, POLICY):
@@ -360,8 +360,14 @@ def publish(gh, repository, revision, config, output, qualifier):
     for relative, checksum in record['files'].items():
         if digest(safe_path(output, relative)) != checksum:
             raise ValueError('Verified artifact was modified: ' + relative)
-    if {str(p.relative_to(output)) for p in output.rglob('*') if p.is_file() and p.name != 'verified.json'} != set(record['files']):
+    if {str(p.relative_to(output)) for p in output.rglob('*')
+            if p.is_file() and p != output / 'verified.json'} != set(record['files']):
         raise ValueError('Verified artifact file inventory changed')
+    return record
+
+
+def publish(gh, repository, revision, config, output, qualifier):
+    record = validate_artifact(repository, revision, config, output)
     with publication_lock(gh, repository, revision):
         if completed(gh, repository, revision, config):
             return
@@ -471,6 +477,8 @@ def main():
     require_private_package(gh, repository, config)
     done = completed(gh, repository, revision, config)
     if options.operation == 'status':
+        if not done:
+            print(f'Not published: {repository}@{revision}', flush=True)
         if os.environ.get('GITHUB_OUTPUT'):
             with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
                 stream.write('published=' + str(done).lower() + '\n')

@@ -1,0 +1,35 @@
+name: Verify release tooling
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: ~/.cache/app-releases/tools
+          key: release-tools-${{ runner.os }}-${{ hashFiles('release.py') }}
+          restore-keys: release-tools-${{ runner.os }}-
+      - name: Test release boundaries and check tooling
+        run: |
+          python3 -m unittest -v
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import release
+          environment = {**os.environ, **release.SAFE_ENV}
+          release.scan_source(Path.cwd(), environment)
+          release.lint_workflows(Path.cwd(), environment)
+          PY
