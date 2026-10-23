@@ -115,9 +115,16 @@ def unpack(data, destination):
         archive.extractall(destination, filter='data')
 
 
-def archive_source(root, revision, destination, submodules=()):
+def archive_source(root, revision, destination, submodules=(), inputs=()):
     excluded = ['.agents', '.claude', '.codex', '.gemini', '.mcp.json']
-    unpack(run(['git', '-C', root, 'archive', revision, '--', '.',
+    paths = list(inputs) if inputs else ['.']
+    if inputs:
+        paths = list(dict.fromkeys([*paths, '.release', '.nvmrc', 'nginx.conf']))
+        for relative in paths:
+            safe_path(root, relative)
+            if relative.startswith(':') or not git(root, 'ls-tree', revision, '--', relative):
+                raise ValueError('Source inputs must name committed files or directories: ' + relative)
+    unpack(run(['git', '-C', root, 'archive', revision, '--', *paths,
                 *[':(exclude)' + path for path in excluded]], capture=True), destination)
     for relative in submodules:
         original = safe_path(root, relative)
@@ -281,7 +288,7 @@ def verify(root, revision, repository, config, output, *, local=True):
     output.mkdir(parents=True, exist_ok=False)
     with tempfile.TemporaryDirectory(prefix='app-source-') as temporary:
         source = Path(temporary)
-        archive_source(root, revision, source, config.get('submodules', []))
+        archive_source(root, revision, source, config.get('submodules', []), config.get('sourceInputs', []))
         scan_source(source, environment)
         if config.get('workflowLint'):
             lint_workflows(source, environment)

@@ -22,6 +22,13 @@ checksum. Local and optional manual GitHub releases call the same implementation
 PR verification has read-only access; only the separate publication job gets writes.
 Heavy local `check:all` suites are not release defaults.
 
+Repositories containing separately operated products can declare `sourceInputs`
+as committed files/directories for this product's build context. The publisher
+always includes its release configuration, Node pin and nginx configuration.
+Only these inputs enter the isolated build and secret scan; this is not a
+repository-wide credential audit. Keep operator data and other product releases
+outside a frontend build context.
+
 Builds in a nested installation root set `workingDirectory`; all output, evidence
 and environment-file paths remain relative to the repository root. `check` and
 `build` can name a narrower product's package commands. `environment` holds public

@@ -100,6 +100,34 @@ class PublicationTests(unittest.TestCase):
             self.assertEqual((destination / 'engine/engine.py').read_text(), 'committed engine\n')
             self.assertEqual((child / 'engine.py').read_text(), 'uncommitted changes\n')
 
+    def test_product_source_inputs_exclude_unrelated_products_and_require_committed_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'source'
+            root.mkdir()
+            for relative in ['app/index.js', 'operator/catalog.yaml', '.release/config.json', '.nvmrc', 'nginx.conf']:
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text('committed input\n')
+            def git(*args):
+                return subprocess.run(['git', '-C', str(root), '-c', 'user.name=Fixture',
+                    '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false', *args],
+                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            git('init')
+            git('add', '.')
+            git('commit', '-m', 'Separate products')
+            destination = Path(directory) / 'archive'
+            destination.mkdir()
+            release.archive_source(root, 'HEAD', destination, inputs=['app'])
+            self.assertTrue((destination / 'app/index.js').is_file())
+            self.assertTrue((destination / '.release/config.json').is_file())
+            self.assertTrue((destination / '.nvmrc').is_file())
+            self.assertTrue((destination / 'nginx.conf').is_file())
+            self.assertFalse((destination / 'operator').exists())
+            with self.assertRaisesRegex(ValueError, 'committed files'):
+                release.archive_source(root, 'HEAD', destination, inputs=['missing'])
+            with self.assertRaises(ValueError):
+                release.archive_source(root, 'HEAD', destination, inputs=['../outside'])
+
     def test_verified_site_can_contain_its_own_verified_json(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
