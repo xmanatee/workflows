@@ -33,6 +33,12 @@ LEAKS = {
     ('Linux', 'aarch64'): ('linux_arm64', 'e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080'),
     ('Linux', 'x86_64'): ('linux_x64', '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb'),
 }
+ACTIONLINT = {
+    ('Darwin', 'arm64'): ('darwin_arm64', 'aba9ced2dee8d27fecca3dc7feb1a7f9a52caefa1eb46f3271ea66b6e0e6953f'),
+    ('Darwin', 'x86_64'): ('darwin_amd64', '5b44c3bc2255115c9b69e30efc0fecdf498fdb63c5d58e17084fd5f16324c644'),
+    ('Linux', 'aarch64'): ('linux_arm64', '325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6'),
+    ('Linux', 'x86_64'): ('linux_amd64', '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8'),
+}
 CACHE = Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache')) / 'app-releases'
 SAFE_ENV = {'DO_NOT_TRACK': '1', 'NEXT_TELEMETRY_DISABLED': '1', 'ASTRO_TELEMETRY_DISABLED': '1',
             'STORYBOOK_DISABLE_TELEMETRY': '1', 'DOTNET_CLI_TELEMETRY_OPTOUT': '1',
@@ -207,6 +213,24 @@ def scan_source(root, environment):
     run([executable, 'dir', root, '--redact=100', '--no-banner'], env=environment)
 
 
+def lint_workflows(root, environment):
+    name, checksum = ACTIONLINT[(platform.system(), platform.machine())]
+    directory = CACHE / ('tools/actionlint-1.7.12-' + name)
+    executable = directory / 'actionlint'
+    if not executable.exists():
+        directory.mkdir(parents=True, exist_ok=True)
+        url = f'https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_{name}.tar.gz'
+        with urllib.request.urlopen(url, timeout=60) as response:
+            data = response.read()
+        if hashlib.sha256(data).hexdigest() != checksum:
+            raise ValueError('Actionlint download checksum mismatch')
+        with tarfile.open(fileobj=io.BytesIO(data)) as archive:
+            executable.write_bytes(archive.extractfile(archive.getmember('actionlint')).read())
+        executable.chmod(0o755)
+    run(['shellcheck', '--version'], env=environment)
+    run([executable], cwd=root, env=environment)
+
+
 def verify(root, revision, repository, config, output, *, local=True):
     environment = {**os.environ, **SAFE_ENV}
     # Verification never receives publisher credentials, including through gh's keychain.
@@ -218,6 +242,8 @@ def verify(root, revision, repository, config, output, *, local=True):
         source = Path(temporary)
         unpack(run(['git', '-C', root, 'archive', revision], capture=True), source)
         scan_source(source, environment)
+        if config.get('workflowLint'):
+            lint_workflows(source, environment)
         for relative in config.get('cachePaths', []) if local else []:
             origin, target = safe_path(root, relative), safe_path(source, relative)
             if origin.is_dir() and not target.exists():
