@@ -9,6 +9,8 @@ Requirements: Python 3.12+, GitHub CLI authenticated with repository and package
 publishing access, Docker/Buildx, and the Node version in the app's `.nvmrc`.
 The package manager comes from its exact `packageManager` pin. Dependencies use
 frozen installation and local stores; speech assets can reuse a verified local cache.
+Successful local builds survive a failed publication in the private artifact cache;
+retrying verifies their hashes and resumes publication. Publication removes that cache.
 All downloads of executable tooling have pinned versions and checksums.
 
 `.release/config.json` owns app-specific checks, output paths, licensing evidence

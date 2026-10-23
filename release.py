@@ -362,6 +362,8 @@ def publish(gh, repository, revision, config, output, qualifier):
                 k: v for k, v in docker_config.items() if k in ('currentContext', 'cliPluginsExtraDirs')}))
             if 'currentContext' in docker_config and (original.parent / 'contexts').exists():
                 (private / 'docker/contexts').symlink_to(original.parent / 'contexts', target_is_directory=True)
+            if (original.parent / 'cli-plugins').exists():
+                (private / 'docker/cli-plugins').symlink_to(original.parent / 'cli-plugins', target_is_directory=True)
             environment['BUILDX_CONFIG'] = str(original.parent / 'buildx')
             run(['docker', 'login', 'ghcr.io', '--username', repository.split('/')[0], '--password-stdin'],
                 env=environment, data=(gh.token + '\n').encode(), capture=True)
@@ -420,6 +422,7 @@ def publish(gh, repository, revision, config, output, qualifier):
 
 
 def main():
+    os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('operation', choices=['deploy', 'status', 'verify', 'publish'], nargs='?', default='deploy')
     parser.add_argument('--root', type=Path, default=Path.cwd())
@@ -462,10 +465,19 @@ def main():
     else:
         if not options.qualifier and platform.machine() not in ('x86_64', 'AMD64'):
             raise ValueError('Set RELEASE_QUALIFIER to the existing native amd64 qualification host')
-        with tempfile.TemporaryDirectory(prefix='app-release-') as temporary:
-            output = Path(temporary) / 'artifact'
-            verify(root, revision, repository, config, output)
-            publish(gh, repository, revision, config, output, options.qualifier)
+        artifacts = CACHE / 'verified' / repository
+        artifacts.mkdir(parents=True, exist_ok=True)
+        output = artifacts / revision
+        if not output.exists():
+            with tempfile.TemporaryDirectory(prefix='prepare-', dir=artifacts) as temporary:
+                prepared = Path(temporary) / 'artifact'
+                verify(root, revision, repository, config, prepared)
+                if not output.exists():
+                    prepared.rename(output)
+        else:
+            print('Reusing the verified artifact; publication rechecks all recorded hashes.', flush=True)
+        publish(gh, repository, revision, config, output, options.qualifier)
+        shutil.rmtree(output)
 
 
 if __name__ == '__main__':
