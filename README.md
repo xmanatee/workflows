@@ -1,3 +1,50 @@
-# Workflows
+# Application releases
 
-Shared GitHub Actions workflows for publishing verified OCI application releases.
+`npm run deploy` or `pnpm run deploy` in an enrolled app checks and builds committed,
+pushed `main`, qualifies its production image, and publishes an immutable GitHub
+Release. Ansible consumes the existing `release.json` and image digest as before.
+Uncommitted work never enters a release. No GitHub Actions minutes are required.
+
+Requirements: Python 3.12+, GitHub CLI authenticated with repository and package
+publishing access, Docker/Buildx, and the Node version in the app's `.nvmrc`.
+The package manager comes from its exact `packageManager` pin. Dependencies use
+frozen installation and local stores; speech assets can reuse a verified local cache.
+All downloads of executable tooling have pinned versions and checksums.
+
+`.release/config.json` owns app-specific checks, output paths, licensing evidence
+and the private image name. `.release/deploy.py` pins this publisher by commit and
+checksum. Local and optional manual GitHub releases call the same implementation.
+PR verification has read-only access; only the separate publication job gets writes.
+Heavy local `check:all` suites are not release defaults.
+
+The publisher scans committed source for secrets, runs `check`, preserves the app's
+dependency/license/SBOM gates, builds once, checks required output and hashes the
+artifact. It builds a copy-only amd64 image from a pinned nginx base, checks the
+exact digest on native amd64, and scans high/critical fixable vulnerabilities before
+publishing. Failed qualification never becomes a deployable release. Images must
+be private. Provider build credentials stay local or in the existing GitHub secrets.
+
+On ARM, configure a native qualification host once in
+`~/.config/app-releases/config.json`, for example `{"qualifier":"server@your-host"}`,
+or set `RELEASE_QUALIFIER`. The existing controller host can perform this short
+container smoke check over SSH using its own read-only registry identity. It does
+not build the app or receive the laptop's publishing credentials. Temporary
+containers, credentials and newly pulled qualification images are removed.
+Deployment itself still follows Ansible polling. Native amd64 CI qualifies locally.
+
+Release tags are `release-<full-source-SHA>`. A complete immutable release skips
+installation, checks, build and publication. Drafts and incomplete releases fail
+explicitly. An atomic `release-publication-lock` Git branch serializes local and
+hosted publishers; the winner rechecks publication. Locks are removed on normal
+failure/signals and never expire automatically. After a power loss, inspect the
+claim commit (host and PID), confirm its publisher has stopped, then remove that
+branch before retrying. Do not delete a live publisher's claim. A failed draft must
+be inspected and removed before retrying that revision.
+
+Only a release still matching remote `main` may become `latest`; a slower old build
+cannot move deployment backwards. Published does not mean installed: the existing
+controller must reconcile successfully. Rollback remains an explicit operational
+choice using retained immutable releases.
+
+Projects with provider-specific or signed native releases retain their own flows.
+No application secrets, registry service or deployment daemon live in this repo.
