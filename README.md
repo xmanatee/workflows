@@ -20,7 +20,7 @@ All downloads of executable tooling have pinned versions and checksums.
 `.release/config.json` owns app-specific checks, output paths, licensing evidence
 and the private image name. `.release/deploy.py` pins this publisher by commit and
 checksum. Local and optional manual GitHub releases call the same implementation.
-PR verification has read-only access; only the separate publication job gets writes.
+Verification has read-only access; only the separate publication job gets writes. Hosted publication accepts only main-branch pushes or manual runs.
 Heavy local `check:all` suites are not release defaults.
 
 Repositories containing separately operated products can declare `sourceInputs`
