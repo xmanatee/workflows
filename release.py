@@ -187,7 +187,7 @@ def toolchain(root, environment):
     if not executable.exists():
         install.mkdir(parents=True, exist_ok=True)
         run(['npm', 'install', '--prefix', install, '--ignore-scripts', '--no-package-lock',
-             '--no-audit', '--no-fund', manager + '@' + version], env=environment)
+             '--no-audit', '--no-fund', manager + '@' + version], cwd=install, env=environment)
     # Nested package scripts must use the same pinned manager.
     environment['PATH'] = str(install / 'node_modules/.bin') + os.pathsep + environment['PATH']
     return ['node', str(executable)]
@@ -226,7 +226,8 @@ def lint_workflows(root, environment):
             executable.write_bytes(archive.extractfile(archive.getmember('actionlint')).read())
         executable.chmod(0o755)
     run(['shellcheck', '--version'], env=environment)
-    run([executable], cwd=root, env=environment)
+    workflows = sorted((root / '.github/workflows').glob('*.yml')) + sorted((root / '.github/workflows').glob('*.yaml'))
+    run([executable, *workflows], cwd=root, env=environment)
 
 
 def verify(root, revision, repository, config, output, *, local=True):
