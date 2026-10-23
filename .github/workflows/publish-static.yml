@@ -76,6 +76,7 @@ jobs:
           OPENAI_VISION_MODEL: ${{ vars.OPENAI_VISION_MODEL }}
         run: python3 .publisher/release.py verify --artifact "$RUNNER_TEMP/artifact"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: github.event_name != 'pull_request'
         with:
           name: qualified-app
           path: ${{ runner.temp }}/artifact/
