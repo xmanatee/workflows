@@ -432,6 +432,10 @@ def main():
             options.qualifier = json.loads(settings.read_text()).get('qualifier')
     root = options.root.resolve()
     revision = git(root, 'rev-parse', 'HEAD')
+    pin = re.search(r'^SHA256 = "([a-f0-9]{64})"$',
+                    git(root, 'show', revision + ':.release/deploy.py'), re.MULTILINE)
+    if not pin or pin.group(1) != digest(Path(__file__)):
+        raise ValueError('Publisher does not match the committed deploy command pin')
     config = json.loads(git(root, 'show', revision + ':.release/config.json'))
     repository = config['repository']
     gh = GitHub()
