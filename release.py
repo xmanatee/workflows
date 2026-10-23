@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """The shared local/CI publisher for private static applications (Python 3.12+)."""
 import argparse
-import base64
 from contextlib import contextmanager
 import hashlib
 import io
@@ -18,7 +17,6 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -287,14 +285,15 @@ def verify(root, revision, repository, config, output, *, local=True):
 # Executed on an existing native amd64 host. It reads only that host's registry identity;
 # neither the local GitHub session nor provider build secrets are transmitted.
 ACCEPT = r'''
-import hashlib,json,os,pathlib,platform,subprocess,sys,tempfile,time,urllib.request,uuid
+import hashlib,json,os,pathlib,platform,signal,subprocess,sys,tempfile,time,urllib.request,uuid
 image,expected=sys.argv[1:]
 assert platform.machine()=='x86_64', 'Native amd64 qualification is required'
+for sig in (signal.SIGTERM,signal.SIGHUP): signal.signal(sig,lambda *_: sys.exit(143))
 name='app-acceptance-'+uuid.uuid4().hex
 with tempfile.TemporaryDirectory(prefix='app-acceptance-') as private:
  env={**os.environ,'DOCKER_CONFIG':private}
  def run(args,capture=False,data=None):
-  return subprocess.run(args,check=True,env=env,input=data,stdout=subprocess.PIPE if capture else None).stdout
+  return subprocess.run(args,check=True,env=env,input=data,timeout=120,stdout=subprocess.PIPE if capture else None).stdout
  existed=subprocess.run(['docker','image','inspect',image],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0
  try:
   if pathlib.Path('/etc/servers-controller/secrets.json').is_file():
@@ -367,13 +366,17 @@ def publish(gh, repository, revision, config, output, qualifier):
             environment['BUILDX_CONFIG'] = str(original.parent / 'buildx')
             run(['docker', 'login', 'ghcr.io', '--username', repository.split('/')[0], '--password-stdin'],
                 env=environment, data=(gh.token + '\n').encode(), capture=True)
-            (output / 'Dockerfile').write_text(f'FROM {BASE}\nCOPY nginx.conf /etc/nginx/nginx.conf\n'
+            # A private host umask must not make the served tree unreadable to nginx.
+            for path in [output / 'site', *(output / 'site').rglob('*')]:
+                path.chmod(0o755 if path.is_dir() else 0o644)
+            dockerfile = private / 'Dockerfile'
+            dockerfile.write_text(f'FROM {BASE}\nCOPY nginx.conf /etc/nginx/nginx.conf\n'
                 'COPY site/ /usr/share/nginx/html/\nHEALTHCHECK --interval=15s --timeout=5s --retries=3 '
                 'CMD wget -q --spider http://127.0.0.1/\n')
             tag = config['image'] + ':sha-' + revision
             metadata = private / 'build.json'
             run(['docker', 'buildx', 'build', '--platform', 'linux/amd64', '--push', '--provenance=false',
-                 '--tag', tag, '--metadata-file', metadata, '--label',
+                 '--tag', tag, '--metadata-file', metadata, '--file', dockerfile, '--label',
                  'org.opencontainers.image.source=https://github.com/' + repository,
                  '--label', 'org.opencontainers.image.revision=' + revision, output], env=environment)
             image = config['image'] + '@' + json.loads(metadata.read_text())['containerimage.digest']
@@ -389,7 +392,10 @@ def publish(gh, repository, revision, config, output, qualifier):
             cache.mkdir(parents=True, exist_ok=True)
             cache.chmod(0o777)
             environment.update(TRIVY_USERNAME=repository.split('/')[0], TRIVY_PASSWORD=gh.token)
-            run(['docker', 'run', '--rm', '--user', '65532:65532', '--cap-drop', 'ALL',
+            native = run(['docker', 'version', '--format', '{{.Server.Arch}}'], env=environment, capture=True).decode().strip()
+            if native not in ('amd64', 'arm64'):
+                raise ValueError('A native amd64 or arm64 Docker worker is required for scanning')
+            run(['docker', 'run', '--rm', '--platform', 'linux/' + native, '--user', '65532:65532', '--cap-drop', 'ALL',
                  '--security-opt', 'no-new-privileges', '--env', 'TRIVY_USERNAME', '--env', 'TRIVY_PASSWORD',
                  '--mount', f'type=bind,src={cache},dst=/cache', TRIVY, 'image', '--cache-dir', '/cache',
                  '--image-src', 'remote', '--platform', 'linux/amd64', '--scanners', 'vuln',
