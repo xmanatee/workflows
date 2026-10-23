@@ -189,7 +189,7 @@ def toolchain(root, environment):
     executable = install / 'node_modules/.bin' / manager
     if not executable.exists():
         install.mkdir(parents=True, exist_ok=True)
-        run(['npm', 'install', '--prefix', install, '--ignore-scripts', '--no-package-lock',
+        run(['npm', 'install', '--prefix', install, '--no-package-lock',
              '--no-audit', '--no-fund', manager + '@' + version], cwd=install, env=environment)
     # Nested package scripts must use the same pinned manager.
     environment['PATH'] = str(install / 'node_modules/.bin') + os.pathsep + environment['PATH']
@@ -249,10 +249,8 @@ def verify(root, revision, repository, config, output, *, local=True):
         scan_source(source, environment)
         if config.get('workflowLint'):
             lint_workflows(source, environment)
-        for relative in config.get('cachePaths', []) if local else []:
-            origin, target = safe_path(root, relative), safe_path(source, relative)
-            if origin.is_dir() and not target.exists():
-                shutil.copytree(origin, target)
+        for name, relative in config.get('cacheEnv', {}).items() if local else []:
+            environment[name] = str(safe_path(root, relative))
         # Vite reads the private local build inputs, but only after committed-source scanning.
         if local and config.get('localEnv'):
             original = safe_path(root, config['localEnv'])
