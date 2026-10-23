@@ -6,6 +6,10 @@ on:
         description: Exact shared publisher commit, also pinned by the local deploy command
         required: true
         type: string
+      uv:
+        description: Install the pinned uv prerequisite for Python build inputs
+        type: boolean
+        default: false
       submodules:
         description: Initialize the committed source submodules required by this build
         type: boolean
@@ -63,6 +67,11 @@ jobs:
         with:
           node-version-file: .nvmrc
           package-manager-cache: false
+      - uses: astral-sh/setup-uv@56618cab7a58e3efc9b282dd3de75bbf1075db9b
+        if: inputs.uv
+        with:
+          version: '0.13.1'
+          enable-cache: false
       - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
         with:
           path: |
