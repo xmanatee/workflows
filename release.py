@@ -393,8 +393,11 @@ def validate_artifact(repository, revision, config, output):
     return record
 
 
-def image_context(output, context):
+def image_context(output, context, immutable_directories=()):
     """Package independent static directories with deterministic layer metadata."""
+    if any(not re.fullmatch(r'[a-zA-Z0-9_-][a-zA-Z0-9._-]*', name)
+           or not (output / 'site' / name).is_dir() for name in immutable_directories):
+        raise ValueError('Immutable directories must name existing top-level static output directories')
     context.mkdir()
     shutil.copyfile(output / 'nginx.conf', context / 'nginx.conf')
     lines = [f'FROM {BASE}', 'COPY nginx.conf /etc/nginx/nginx.conf']
@@ -412,11 +415,13 @@ def image_context(output, context):
             if path.is_dir():
                 shutil.copytree(path, target)
             else:
-                shutil.copyfile(path, target)
+                shutil.copy2(path, target)
         # Include deterministic parent directories; otherwise COPY invents timestamps.
         for path in [layer, *layer.rglob('*')]:
             path.chmod(0o755 if path.is_dir() else 0o644)
-            os.utime(path, (0, 0))
+            # Mutable files retain their mtime for nginx ETag/Last-Modified checks.
+            if path.is_dir() or group[0].name in immutable_directories:
+                os.utime(path, (0, 0))
         lines.append(f'COPY --link layers/{index}/ /')
     lines.append('HEALTHCHECK --interval=15s --timeout=5s --retries=3 CMD wget -q --spider http://127.0.0.1/')
     return '\n'.join(lines) + '\n'
@@ -446,7 +451,7 @@ def publish(gh, repository, revision, config, output, qualifier):
                 env=environment, data=(gh.token + '\n').encode(), capture=True)
             dockerfile = private / 'Dockerfile'
             context = private / 'context'
-            dockerfile.write_text(image_context(output, context))
+            dockerfile.write_text(image_context(output, context, config.get('immutableDirectories', [])))
             tag = config['image'] + ':sha-' + revision
             metadata = private / 'build.json'
             run(['docker', 'buildx', 'build', '--platform', 'linux/amd64', '--push', '--provenance=false',

@@ -47,13 +47,14 @@ class PublicationTests(unittest.TestCase):
             (site / 'manifest[1].json').write_text('{}')
             before = {str(p.relative_to(site)): release.digest(p) for p in site.rglob('*') if p.is_file()}
             context = root / 'context'
-            dockerfile = release.image_context(root, context)
+            dockerfile = release.image_context(root, context, ['speech-models'])
             self.assertIn('COPY --link layers/0/ /', dockerfile)
             emitted = {}
             for layer in (context / 'layers').iterdir():
                 served = layer / 'usr/share/nginx/html'
                 for path in layer.rglob('*'):
-                    self.assertEqual(path.stat().st_mtime, 0)
+                    if path.is_dir() or layer.name == '0':
+                        self.assertEqual(path.stat().st_mtime, 0)
                     self.assertEqual(path.stat().st_mode & 0o777, 0o755 if path.is_dir() else 0o644)
                     if path.is_file():
                         relative = str(path.relative_to(served))
@@ -63,7 +64,11 @@ class PublicationTests(unittest.TestCase):
             self.assertEqual({str(p.relative_to(site)): release.digest(p)
                               for p in site.rglob('*') if p.is_file()}, before)
             index.write_text('second application')
-            self.assertEqual(release.image_context(root, root / 'second'), dockerfile)
+            self.assertEqual(release.image_context(root, root / 'second', ['speech-models']), dockerfile)
+            served_index = root / 'second/layers/1/usr/share/nginx/html/index.html'
+            self.assertEqual(served_index.stat().st_mtime_ns, index.stat().st_mtime_ns)
+            with self.assertRaisesRegex(ValueError, 'Immutable directories'):
+                release.image_context(root, root / 'invalid', ['../outside'])
 
     def test_web_channels_cannot_collide_with_native_release_tags(self):
         revision = 'a' * 40

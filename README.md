@@ -42,9 +42,11 @@ exact digest on native amd64, and scans high/critical fixable vulnerabilities be
 publishing. Failed qualification never becomes a deployable release. Images must
 be private. Provider build credentials stay local or in the existing GitHub secrets.
 
-Each static output directory occupies an independent image layer. File timestamps
-are normalized so unchanged assets, including speech models, share layers across
-releases and cold builds; application updates do not duplicate those assets on hosts.
+Each static output directory occupies an independent image layer. Apps may declare
+`immutableDirectories` for top-level output directories whose URLs change whenever
+their content changes. Their timestamps are normalized so unchanged assets, including
+speech models, share layers across cold builds. Other files retain modification times
+for HTTP cache validation.
 
 On ARM, configure a native qualification host once in
 `~/.config/app-releases/config.json`, for example `{"qualifier":"server@your-host"}`,
