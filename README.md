@@ -1,9 +1,11 @@
 # Application releases
 
-`npm run deploy` or `pnpm run deploy` in an enrolled app checks and builds committed,
+`python3 .release/deploy.py` in an enrolled app checks and builds committed,
 pushed `main`, qualifies its production image, and publishes an immutable GitHub
 Release. Ansible consumes the existing `release.json` and image digest as before.
 Uncommitted work never enters a release. No GitHub Actions minutes are required.
+With the project's pinned Node and package manager selected, `npm run deploy` or
+`pnpm run deploy` calls the same publisher.
 
 Requirements: Python 3.12+, GitHub CLI authenticated with repository and package
 publishing access, Docker/Buildx, and the Node version in the app's `.nvmrc`.
