@@ -189,6 +189,8 @@ def toolchain(root, environment):
     executable = install / 'node_modules/.bin' / manager
     if not executable.exists():
         install.mkdir(parents=True, exist_ok=True)
+        (install / 'package.json').write_text(json.dumps({'private': True,
+            'allowScripts': {manager + '@' + version: True}}) + '\n')
         run(['npm', 'install', '--prefix', install, '--no-package-lock',
              '--no-audit', '--no-fund', manager + '@' + version], cwd=install, env=environment)
     # Nested package scripts must use the same pinned manager.
