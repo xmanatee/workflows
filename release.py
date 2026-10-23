@@ -126,6 +126,17 @@ def read_manifest(gh, repository, release):
     return json.loads(data)
 
 
+def require_private_package(gh, repository, config, *, published=False):
+    owner = repository.split('/')[0]
+    prefix = 'ghcr.io/' + owner + '/'
+    if not re.fullmatch(re.escape(prefix) + r'[a-z0-9][a-z0-9._-]*', config['image']):
+        raise ValueError('The image must belong to the source repository owner')
+    package = config['image'].removeprefix(prefix)
+    record = gh.api(f'users/{owner}/packages/container/{package}', missing=not published)
+    if record is not None and record['visibility'] != 'private':
+        raise ValueError('Refusing to upload private application content to a public package')
+
+
 def completed(gh, repository, revision, config):
     release = gh.api(f'repos/{repository}/releases/tags/release-{revision}', missing=True)
     if release is None:
@@ -354,6 +365,7 @@ def publish(gh, repository, revision, config, output, qualifier):
     with publication_lock(gh, repository, revision):
         if completed(gh, repository, revision, config):
             return
+        require_private_package(gh, repository, config)
         with tempfile.TemporaryDirectory(prefix='app-publisher-') as private:
             private = Path(private)
             environment = {**os.environ, **SAFE_ENV, 'DOCKER_CONFIG': str(private / 'docker')}
@@ -384,10 +396,7 @@ def publish(gh, repository, revision, config, output, qualifier):
                  'org.opencontainers.image.source=https://github.com/' + repository,
                  '--label', 'org.opencontainers.image.revision=' + revision, output], env=environment)
             image = config['image'] + '@' + json.loads(metadata.read_text())['containerimage.digest']
-            package = config['image'].removeprefix('ghcr.io/' + repository.split('/')[0] + '/')
-            visibility = gh.api(f'users/{repository.split("/")[0]}/packages/container/{package}')['visibility']
-            if visibility != 'private':
-                raise ValueError('Refusing to release an image in a public package')
+            require_private_package(gh, repository, config, published=True)
             # The native CI worker uses its temporary publisher config for the pull.
             if not qualifier:
                 os.environ['DOCKER_CONFIG'] = environment['DOCKER_CONFIG']
@@ -459,6 +468,7 @@ def main():
     gh = GitHub()
     if not gh.api(f'repos/{repository}')['private']:
         raise ValueError('Local private releases require a private source repository')
+    require_private_package(gh, repository, config)
     done = completed(gh, repository, revision, config)
     if options.operation == 'status':
         if os.environ.get('GITHUB_OUTPUT'):

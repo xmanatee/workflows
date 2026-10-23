@@ -33,6 +33,16 @@ class FakeGitHub:
 
 
 class PublicationTests(unittest.TestCase):
+    def test_public_packages_are_rejected_before_upload(self):
+        gh = FakeGitHub()
+        with patch.object(gh, 'api', return_value={'visibility': 'public'}):
+            with self.assertRaisesRegex(ValueError, 'Refusing to upload'):
+                release.require_private_package(gh, 'owner/app', {'image': 'ghcr.io/owner/app'})
+        with patch.object(gh, 'api', return_value=None):
+            release.require_private_package(gh, 'owner/app', {'image': 'ghcr.io/owner/app'})
+        with self.assertRaisesRegex(ValueError, 'source repository owner'):
+            release.require_private_package(gh, 'owner/app', {'image': 'ghcr.io/stranger/app'})
+
     def test_local_and_ci_publishers_cannot_hold_the_same_claim(self):
         gh = FakeGitHub()
         with release.publication_lock(gh, 'owner/app', 'a' * 40):
