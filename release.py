@@ -435,6 +435,29 @@ def image_context(output, context, immutable_directories=()):
     return '\n'.join(lines) + '\n'
 
 
+def scan_image(image, private, environment):
+    # Export the selected digest once; the scanner gets no registry or Docker socket access.
+    archive = private / 'image.tar'
+    run(['docker', 'image', 'save', '--output', archive, image], env=environment)
+    archive.chmod(0o644)
+    cache = CACHE / 'trivy'
+    cache.mkdir(parents=True, exist_ok=True)
+    cache.chmod(0o777)
+    native = run(['docker', 'version', '--format', '{{.Server.Arch}}'], env=environment, capture=True).decode().strip()
+    if native not in ('amd64', 'arm64'):
+        raise ValueError('A native amd64 or arm64 Docker worker is required for scanning')
+    # Trivy's filesystem cache is process-exclusive, including across repositories.
+    with (CACHE / 'trivy.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        run(['docker', 'run', '--rm', '--platform', 'linux/' + native, '--user', '65532:65532', '--cap-drop', 'ALL',
+             '--security-opt', 'no-new-privileges',
+             '--mount', f'type=bind,src={cache},dst=/cache',
+             '--mount', f'type=bind,src={archive},dst=/scan/image.tar,readonly',
+             TRIVY, 'image', '--cache-dir', '/cache', '--input', '/scan/image.tar', '--platform', 'linux/amd64',
+             '--scanners', 'vuln', '--disable-telemetry', '--skip-version-check', '--severity', 'HIGH,CRITICAL',
+             '--ignore-unfixed', '--exit-code', '1', '--timeout', '15m'], env=environment)
+
+
 def publish(gh, repository, revision, config, output, qualifier):
     record = validate_artifact(repository, revision, config, output)
     with publication_lock(gh, repository, revision):
@@ -481,22 +504,7 @@ def publish(gh, repository, revision, config, output, qualifier):
             if not checks:
                 raise ValueError('At least one runtime smoke check is required')
             qualify(image, checks, qualifier)
-            cache = CACHE / 'trivy'
-            cache.mkdir(parents=True, exist_ok=True)
-            cache.chmod(0o777)
-            environment.update(TRIVY_USERNAME=repository.split('/')[0], TRIVY_PASSWORD=gh.token)
-            native = run(['docker', 'version', '--format', '{{.Server.Arch}}'], env=environment, capture=True).decode().strip()
-            if native not in ('amd64', 'arm64'):
-                raise ValueError('A native amd64 or arm64 Docker worker is required for scanning')
-            # Trivy's filesystem cache is process-exclusive, including across repositories.
-            with (CACHE / 'trivy.lock').open('a') as lock:
-                fcntl.flock(lock, fcntl.LOCK_EX)
-                run(['docker', 'run', '--rm', '--platform', 'linux/' + native, '--user', '65532:65532', '--cap-drop', 'ALL',
-                     '--security-opt', 'no-new-privileges', '--env', 'TRIVY_USERNAME', '--env', 'TRIVY_PASSWORD',
-                     '--mount', f'type=bind,src={cache},dst=/cache', TRIVY, 'image', '--cache-dir', '/cache',
-                     '--image-src', 'remote', '--platform', 'linux/amd64', '--scanners', 'vuln',
-                     '--disable-telemetry', '--skip-version-check', '--severity', 'HIGH,CRITICAL',
-                     '--ignore-unfixed', '--exit-code', '1', '--timeout', '15m', image], env=environment)
+            scan_image(image, private, environment)
             if config.get('channel') and revision != gh.api(f'repos/{repository}/commits/main')['sha']:
                 raise ValueError('Main advanced during qualification; release its newer revision instead')
             manifest = {'repository': repository, 'revision': revision, 'images': {'app': image},

@@ -34,6 +34,30 @@ class FakeGitHub:
 
 
 class PublicationTests(unittest.TestCase):
+    def test_scan_exports_the_exact_digest_and_retains_security_gates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            private = Path(directory)
+            image = 'ghcr.io/owner/app@sha256:' + 'a' * 64
+            def run(arguments, **kwargs):
+                if arguments[:3] == ['docker', 'image', 'save']:
+                    Path(arguments[4]).write_bytes(b'fixture')
+                if arguments[:2] == ['docker', 'version']:
+                    return b'arm64\n'
+            with patch.object(release, 'CACHE', private / 'cache'), patch.object(release, 'run', side_effect=run) as command, \
+                    patch.object(release.fcntl, 'flock') as lock:
+                release.scan_image(image, private, {})
+            self.assertEqual(command.call_args_list[0].args[0],
+                             ['docker', 'image', 'save', '--output', private / 'image.tar', image])
+            scanner = command.call_args_list[-1].args[0]
+            self.assertIn('type=bind,src=' + str(private / 'image.tar') + ',dst=/scan/image.tar,readonly', scanner)
+            self.assertIn('--input', scanner)
+            self.assertIn('--disable-telemetry', scanner)
+            self.assertIn('HIGH,CRITICAL', scanner)
+            self.assertEqual(scanner[scanner.index('--exit-code') + 1], '1')
+            self.assertNotIn('--image-src', scanner)
+            self.assertNotIn('TRIVY_PASSWORD', scanner)
+            lock.assert_called_once()
+
     def test_image_layers_preserve_all_files_and_normalize_cold_build_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
