@@ -26,6 +26,7 @@ permissions:
   packages: read
 jobs:
   plan:
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     outputs:
@@ -83,16 +84,15 @@ jobs:
       - name: Check and build committed source
         env:
           GH_TOKEN: ${{ github.token }}
-          OPENAI_API_KEY: ${{ github.event_name != 'pull_request' && secrets.OPENAI_API_KEY || '' }}
-          ELEVENLABS_API_KEY: ${{ github.event_name != 'pull_request' && secrets.ELEVENLABS_API_KEY || '' }}
-          HOL_UNLOCK_CODE: ${{ github.event_name != 'pull_request' && secrets.HOL_UNLOCK_CODE || '' }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+          HOL_UNLOCK_CODE: ${{ secrets.HOL_UNLOCK_CODE }}
           VITE_ELEVENLABS_AGENT_ID: ${{ vars.VITE_ELEVENLABS_AGENT_ID }}
           OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
           OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL }}
           OPENAI_VISION_MODEL: ${{ vars.OPENAI_VISION_MODEL }}
         run: python3 .publisher/release.py verify --artifact "$RUNNER_TEMP/artifact"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
-        if: github.event_name != 'pull_request'
         with:
           name: qualified-app
           path: ${{ runner.temp }}/artifact/
@@ -101,7 +101,7 @@ jobs:
           retention-days: 1
   publish:
     needs: [plan, verify]
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && needs.plan.outputs.published != 'true'
+    if: needs.plan.outputs.published != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     permissions:
