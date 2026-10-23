@@ -115,6 +115,30 @@ def unpack(data, destination):
         archive.extractall(destination, filter='data')
 
 
+def archive_source(root, revision, destination, submodules=()):
+    excluded = ['.agents', '.claude', '.codex', '.gemini', '.mcp.json']
+    unpack(run(['git', '-C', root, 'archive', revision, '--', '.',
+                *[':(exclude)' + path for path in excluded]], capture=True), destination)
+    for relative in submodules:
+        original = safe_path(root, relative)
+        if git(original, 'rev-parse', '--show-toplevel') != str(original):
+            raise ValueError('Initialize the pinned submodule before releasing: ' + relative)
+        entry = git(root, 'ls-tree', revision, '--', relative)
+        if not entry.startswith('160000 commit '):
+            raise ValueError('Release submodule is not a committed Git link: ' + relative)
+        commit = entry.split()[2]
+        target = safe_path(destination, relative)
+        target.mkdir(parents=True, exist_ok=True)
+        unpack(run(['git', '-C', original, 'archive', commit], capture=True), target)
+
+
+def release_tag(revision, config):
+    channel = config.get('channel')
+    if channel is not None and not re.fullmatch(r'[a-z][a-z0-9-]*', channel):
+        raise ValueError('Release channels must be lowercase names')
+    return 'release-' + (channel + '-' if channel else '') + revision
+
+
 def read_manifest(gh, repository, release):
     assets = [a for a in release['assets'] if a['name'] == 'release.json']
     if release['draft'] or not release.get('immutable') or len(assets) != 1:
@@ -138,15 +162,17 @@ def require_private_package(gh, repository, config, *, published=False):
 
 
 def completed(gh, repository, revision, config):
-    release = gh.api(f'repos/{repository}/releases/tags/release-{revision}', missing=True)
+    tag = release_tag(revision, config)
+    release = gh.api(f'repos/{repository}/releases/tags/{tag}', missing=True)
     if release is None:
         return False
-    ref = gh.api(f'repos/{repository}/git/ref/tags/release-{revision}')
+    ref = gh.api(f'repos/{repository}/git/ref/tags/{tag}')
     if ref['object']['type'] != 'commit' or ref['object']['sha'] != revision:
         raise ValueError('Release tag does not point to its declared source commit')
     manifest = read_manifest(gh, repository, release)
     qualification = manifest.get('qualification', {})
     if (manifest.get('repository') != repository or manifest.get('revision') != revision
+            or manifest.get('channel') != config.get('channel')
             or qualification.get('policy') != POLICY
             or qualification.get('platform') != 'linux/amd64'
             or any(qualification.get(gate) is not True for gate in ('sourceChecks', 'runtimeSmoke', 'vulnerabilityScan'))
@@ -182,7 +208,7 @@ def publication_lock(gh, repository, revision):
             gh.api(prefix + 'refs/heads/release-publication-lock', 'DELETE')
 
 
-def toolchain(root, environment):
+def toolchain(root, environment, project=None):
     expected = (root / '.nvmrc').read_text().strip().removeprefix('v')
     actual = run(['node', '--version'], env=environment, capture=True).decode().strip().removeprefix('v')
     if actual != expected:
@@ -190,7 +216,7 @@ def toolchain(root, environment):
         if not (selected / 'node').is_file():
             raise ValueError(f'Install Node {expected} (see .nvmrc), then retry')
         environment['PATH'] = str(selected) + os.pathsep + environment['PATH']
-    package = json.loads((root / 'package.json').read_text())
+    package = json.loads(((project or root) / 'package.json').read_text())
     if package.get('private') is not True:
         raise ValueError('Application packages must be private')
     manager, version = package['packageManager'].split('@')
@@ -247,7 +273,7 @@ def lint_workflows(root, environment):
 
 
 def verify(root, revision, repository, config, output, *, local=True):
-    environment = {**os.environ, **SAFE_ENV, 'SOURCE_REVISION': revision}
+    environment = {**os.environ, **config.get('environment', {}), **SAFE_ENV, 'SOURCE_REVISION': revision}
     # Verification never receives publisher credentials, including through gh's keychain.
     for key in ('GH_TOKEN', 'GITHUB_TOKEN', 'ACTIONS_RUNTIME_TOKEN'):
         environment.pop(key, None)
@@ -255,10 +281,7 @@ def verify(root, revision, repository, config, output, *, local=True):
     output.mkdir(parents=True, exist_ok=False)
     with tempfile.TemporaryDirectory(prefix='app-source-') as temporary:
         source = Path(temporary)
-        # Developer tool links can point outside a repository; they are not build inputs.
-        excluded = ['.agents', '.claude', '.codex', '.gemini', '.mcp.json']
-        unpack(run(['git', '-C', root, 'archive', revision, '--', '.',
-                    *[':(exclude)' + path for path in excluded]], capture=True), source)
+        archive_source(root, revision, source, config.get('submodules', []))
         scan_source(source, environment)
         if config.get('workflowLint'):
             lint_workflows(source, environment)
@@ -275,14 +298,15 @@ def verify(root, revision, repository, config, output, *, local=True):
                 value = run(['gh', 'variable', 'get', name, '--repo', repository], capture=True).decode().strip()
                 if value:
                     environment[name] = value
-        manager = toolchain(source, environment)
+        project = safe_path(source, config['workingDirectory']) if config.get('workingDirectory') else source
+        manager = toolchain(source, environment, project)
         install = ['ci'] if Path(manager[0]).name == 'npm' else ['install', '--frozen-lockfile']
-        run([*manager, *install], cwd=source, env=environment)
-        for command in ['check', *config.get('checks', [])]:
-            run([*manager, 'run', command], cwd=source, env=environment, timeout=600)
+        run([*manager, *install], cwd=project, env=environment)
+        for command in [config.get('check', 'check'), *config.get('checks', [])]:
+            run([*manager, 'run', command], cwd=project, env=environment, timeout=600)
         for command in config.get('beforeBuild', []):
-            run([*manager, *command], cwd=source, env=environment)
-        run([*manager, 'run', 'build'], cwd=source, env=environment)
+            run([*manager, *command], cwd=project, env=environment)
+        run([*manager, 'run', config.get('build', 'build')], cwd=project, env=environment)
         for relative in config['required']:
             if not safe_path(source, relative).is_file() or not safe_path(source, relative).stat().st_size:
                 raise ValueError('Required build output missing: ' + relative)
@@ -301,7 +325,7 @@ def verify(root, revision, repository, config, output, *, local=True):
 # neither the local GitHub session nor provider build secrets are transmitted.
 ACCEPT = r'''
 import hashlib,json,os,pathlib,platform,signal,subprocess,sys,tempfile,time,urllib.request,uuid
-image,expected=sys.argv[1:]
+image,checks=sys.argv[1],json.loads(sys.argv[2])
 assert platform.machine()=='x86_64', 'Native amd64 qualification is required'
 for sig in (signal.SIGTERM,signal.SIGHUP): signal.signal(sig,lambda *_: sys.exit(143))
 name='app-acceptance-'+uuid.uuid4().hex
@@ -319,14 +343,16 @@ with tempfile.TemporaryDirectory(prefix='app-acceptance-') as private:
   run(['docker','pull','--platform','linux/amd64',image])
   run(['docker','run','--platform','linux/amd64','--name',name,'--detach','--publish','127.0.0.1::80',image],capture=True)
   port=run(['docker','port',name,'80/tcp'],True).decode().strip().rsplit(':',1)[1]
-  for attempt in range(30):
-   try:
-    with urllib.request.urlopen('http://127.0.0.1:'+port+'/',timeout=3) as response: data=response.read()
-    break
-   except OSError:
-    if attempt==29: raise
-    time.sleep(1)
-  assert hashlib.sha256(data).hexdigest()==expected, 'Runtime response differs from verified build'
+  for check in checks:
+   request=urllib.request.Request('http://127.0.0.1:'+port+check['path'],headers={'Host':check.get('host','localhost')})
+   for attempt in range(30):
+    try:
+     with urllib.request.urlopen(request,timeout=3) as response: data=response.read()
+     break
+    except OSError:
+     if attempt==29: raise
+     time.sleep(1)
+   assert hashlib.sha256(data).hexdigest()==check['sha256'], 'Runtime response differs from verified build: '+check['path']
   run(['docker','exec',name,'nginx','-t'])
  finally:
   subprocess.run(['docker','rm','--force',name],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
@@ -335,17 +361,18 @@ with tempfile.TemporaryDirectory(prefix='app-acceptance-') as private:
 '''
 
 
-def qualify(image, expected, remote):
+def qualify(image, checks, remote):
+    checks = json.dumps(checks)
     if remote:
         if not re.fullmatch(r'[a-zA-Z0-9_.@:-]+', remote):
             raise ValueError('Invalid native qualification host')
-        command = shlex.join(['sudo', '-n', 'python3', '-c', ACCEPT, image, expected])
+        command = shlex.join(['sudo', '-n', 'python3', '-c', ACCEPT, image, checks])
         run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', remote, command])
     else:
         architecture = run(['docker', 'version', '--format', '{{.Server.Arch}}'], capture=True).decode().strip()
         if architecture != 'amd64':
             raise ValueError('Set RELEASE_QUALIFIER to a native amd64 host; CPU emulation is not used')
-        run(['python3', '-c', ACCEPT, image, expected])
+        run(['python3', '-c', ACCEPT, image, checks])
 
 
 def should_promote(revision, current_main):
@@ -406,7 +433,16 @@ def publish(gh, repository, revision, config, output, qualifier):
             # The native CI worker uses its temporary publisher config for the pull.
             if not qualifier:
                 os.environ['DOCKER_CONFIG'] = environment['DOCKER_CONFIG']
-            qualify(image, record['files']['site/index.html'], qualifier)
+            checks = []
+            for check in config.get('smoke', [{'path': '/', 'file': 'index.html'}]):
+                relative = 'site/' + check['file']
+                safe_path(output / 'site', check['file'])
+                if not check['path'].startswith('/') or check['path'].startswith('//'):
+                    raise ValueError('Smoke requests must use application-relative paths')
+                checks.append({**check, 'sha256': record['files'][relative]})
+            if not checks:
+                raise ValueError('At least one runtime smoke check is required')
+            qualify(image, checks, qualifier)
             cache = CACHE / 'trivy'
             cache.mkdir(parents=True, exist_ok=True)
             cache.chmod(0o777)
@@ -420,9 +456,13 @@ def publish(gh, repository, revision, config, output, qualifier):
                  '--image-src', 'remote', '--platform', 'linux/amd64', '--scanners', 'vuln',
                  '--disable-telemetry', '--skip-version-check', '--severity', 'HIGH,CRITICAL',
                  '--ignore-unfixed', '--exit-code', '1', '--timeout', '15m', image], env=environment)
+            if config.get('channel') and revision != gh.api(f'repos/{repository}/commits/main')['sha']:
+                raise ValueError('Main advanced during qualification; release its newer revision instead')
             manifest = {'repository': repository, 'revision': revision, 'images': {'app': image},
                         'qualification': {'policy': POLICY, 'platform': 'linux/amd64',
                                           'sourceChecks': True, 'runtimeSmoke': True, 'vulnerabilityScan': True}}
+            if config.get('channel'):
+                manifest['channel'] = config['channel']
             manifest_path = private / 'release.json'
             manifest_path.write_text(json.dumps(manifest) + '\n')
             assets = [str(manifest_path)]
@@ -432,20 +472,22 @@ def publish(gh, repository, revision, config, output, qualifier):
                     archive.add(output / 'evidence', arcname='evidence')
                 assets.append(str(evidence))
             gh_env = {**environment, 'GH_TOKEN': gh.token}
-            release_tag = 'release-' + revision
-            reference = gh.api(f'repos/{repository}/git/ref/tags/{release_tag}', missing=True)
+            tag = release_tag(revision, config)
+            reference = gh.api(f'repos/{repository}/git/ref/tags/{tag}', missing=True)
             if reference is None:
-                gh.api(f'repos/{repository}/git/refs', 'POST', {'ref': 'refs/tags/' + release_tag, 'sha': revision})
+                gh.api(f'repos/{repository}/git/refs', 'POST', {'ref': 'refs/tags/' + tag, 'sha': revision})
             elif reference['object']['type'] != 'commit' or reference['object']['sha'] != revision:
                 raise ValueError('Release tag already identifies different source')
-            run(['gh', 'release', 'create', release_tag, *assets, '--repo', repository,
+            run(['gh', 'release', 'create', tag, *assets, '--repo', repository,
                  '--verify-tag', '--title', 'Release ' + revision[:12], '--notes',
                  'Qualified private application image. Deployment follows the existing Ansible poller.',
                  '--draft', '--latest=false'], env=gh_env)
             latest = gh.api(f'repos/{repository}/commits/main')['sha']
             promote = should_promote(revision, latest)
-            run(['gh', 'release', 'edit', release_tag, '--repo', repository, '--draft=false',
-                 '--latest=' + str(promote).lower()], env=gh_env)
+            if config.get('channel') and not promote:
+                raise ValueError('Main advanced before publication; inspect the draft before retrying')
+            run(['gh', 'release', 'edit', tag, '--repo', repository, '--draft=false',
+                 '--latest=' + str(promote and not config.get('channel')).lower()], env=gh_env)
             if not completed(gh, repository, revision, config):
                 raise ValueError('Published release could not be verified')
             print('Published for Ansible polling.' if promote else 'Published; newer main exists, latest preserved.')
@@ -472,8 +514,10 @@ def main():
     config = json.loads(git(root, 'show', revision + ':.release/config.json'))
     repository = config['repository']
     gh = GitHub()
-    if not gh.api(f'repos/{repository}')['private']:
+    if not gh.api(f'repos/{repository}')['private'] and not config.get('allowPublicSource'):
         raise ValueError('Local private releases require a private source repository')
+    if config.get('allowPublicSource') and not config.get('channel'):
+        raise ValueError('Public-source exceptions require a separate release channel')
     require_private_package(gh, repository, config)
     done = completed(gh, repository, revision, config)
     if options.operation == 'status':

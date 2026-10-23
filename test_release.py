@@ -6,6 +6,7 @@ import tarfile
 import tempfile
 import unittest
 import urllib.request
+import subprocess
 from unittest.mock import patch
 
 import release
@@ -33,6 +34,36 @@ class FakeGitHub:
 
 
 class PublicationTests(unittest.TestCase):
+    def test_web_channels_cannot_collide_with_native_release_tags(self):
+        revision = 'a' * 40
+        self.assertEqual(release.release_tag(revision, {}), 'release-' + revision)
+        self.assertEqual(release.release_tag(revision, {'channel': 'web'}), 'release-web-' + revision)
+        with self.assertRaises(ValueError):
+            release.release_tag(revision, {'channel': '../native'})
+
+    def test_archived_submodule_uses_the_committed_object_not_local_edits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'source'
+            child = root / 'engine'
+            child.mkdir(parents=True)
+            def git(path, *args):
+                return subprocess.check_output(['git', '-C', str(path), '-c', 'user.name=Fixture',
+                    '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false', *args],
+                    stderr=subprocess.DEVNULL, text=True).strip()
+            git(child, 'init')
+            (child / 'engine.py').write_text('committed engine\n')
+            git(child, 'add', '.')
+            git(child, 'commit', '-m', 'Engine')
+            git(root, 'init')
+            git(root, 'add', 'engine')
+            git(root, 'commit', '-m', 'Pin engine')
+            (child / 'engine.py').write_text('uncommitted changes\n')
+            destination = Path(directory) / 'archive'
+            destination.mkdir()
+            release.archive_source(root, 'HEAD', destination, ['engine'])
+            self.assertEqual((destination / 'engine/engine.py').read_text(), 'committed engine\n')
+            self.assertEqual((child / 'engine.py').read_text(), 'uncommitted changes\n')
+
     def test_verified_site_can_contain_its_own_verified_json(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)

@@ -22,6 +22,19 @@ checksum. Local and optional manual GitHub releases call the same implementation
 PR verification has read-only access; only the separate publication job gets writes.
 Heavy local `check:all` suites are not release defaults.
 
+Builds in a nested installation root set `workingDirectory`; all output, evidence
+and environment-file paths remain relative to the repository root. `check` and
+`build` can name a narrower product's package commands. `environment` holds public
+production build values. `submodules` lists initialized Git links to archive at
+their committed revisions; local changes in them never enter the artifact.
+
+A separately distributed product can set `channel` to publish
+`release-<channel>-<source-SHA>` without changing GitHub's latest release. The
+controller must explicitly select that channel. `allowPublicSource: true` is only
+for such repositories: source and release metadata stay public, while the runtime
+image remains private. A channel release fails if main advances during qualification.
+`smoke` can verify several host/path responses against their emitted `file` hashes.
+
 The publisher scans committed source for secrets, runs `check`, preserves the app's
 dependency/license/SBOM gates, builds once, checks required output and hashes the
 artifact. It builds a copy-only amd64 image from a pinned nginx base, checks the

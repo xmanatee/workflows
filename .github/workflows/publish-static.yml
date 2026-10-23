@@ -6,6 +6,10 @@ on:
         description: Exact shared publisher commit, also pinned by the local deploy command
         required: true
         type: string
+      submodules:
+        description: Initialize the committed source submodules required by this build
+        type: boolean
+        default: false
     secrets:
       OPENAI_API_KEY:
         required: false
@@ -48,6 +52,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+          submodules: ${{ inputs.submodules }}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: xmanatee/workflows
@@ -64,7 +69,7 @@ jobs:
             ~/.npm
             ~/.local/share/pnpm/store
             ~/.cache/app-releases/tools
-          key: release-tools-${{ runner.os }}-${{ hashFiles('.nvmrc', 'package-lock.json', 'pnpm-lock.yaml') }}
+          key: release-tools-${{ runner.os }}-${{ hashFiles('.nvmrc', '**/package-lock.json', '**/pnpm-lock.yaml') }}
           restore-keys: release-tools-${{ runner.os }}-
       - name: Check and build committed source
         env:
