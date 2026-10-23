@@ -232,7 +232,7 @@ def lint_workflows(root, environment):
 
 
 def verify(root, revision, repository, config, output, *, local=True):
-    environment = {**os.environ, **SAFE_ENV}
+    environment = {**os.environ, **SAFE_ENV, 'SOURCE_REVISION': revision}
     # Verification never receives publisher credentials, including through gh's keychain.
     for key in ('GH_TOKEN', 'GITHUB_TOKEN', 'ACTIONS_RUNTIME_TOKEN'):
         environment.pop(key, None)
@@ -240,7 +240,10 @@ def verify(root, revision, repository, config, output, *, local=True):
     output.mkdir(parents=True, exist_ok=False)
     with tempfile.TemporaryDirectory(prefix='app-source-') as temporary:
         source = Path(temporary)
-        unpack(run(['git', '-C', root, 'archive', revision], capture=True), source)
+        # Developer tool links can point outside a repository; they are not build inputs.
+        excluded = ['.agents', '.claude', '.codex', '.gemini', '.mcp.json']
+        unpack(run(['git', '-C', root, 'archive', revision, '--', '.',
+                    *[':(exclude)' + path for path in excluded]], capture=True), source)
         scan_source(source, environment)
         if config.get('workflowLint'):
             lint_workflows(source, environment)
