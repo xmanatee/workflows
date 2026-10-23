@@ -130,6 +130,9 @@ def completed(gh, repository, revision, config):
     release = gh.api(f'repos/{repository}/releases/tags/release-{revision}', missing=True)
     if release is None:
         return False
+    ref = gh.api(f'repos/{repository}/git/ref/tags/release-{revision}')
+    if ref['object']['type'] != 'commit' or ref['object']['sha'] != revision:
+        raise ValueError('Release tag does not point to its declared source commit')
     manifest = read_manifest(gh, repository, release)
     qualification = manifest.get('qualification', {})
     if (manifest.get('repository') != repository or manifest.get('revision') != revision
@@ -415,8 +418,13 @@ def publish(gh, repository, revision, config, output, qualifier):
                 assets.append(str(evidence))
             gh_env = {**environment, 'GH_TOKEN': gh.token}
             release_tag = 'release-' + revision
+            reference = gh.api(f'repos/{repository}/git/ref/tags/{release_tag}', missing=True)
+            if reference is None:
+                gh.api(f'repos/{repository}/git/refs', 'POST', {'ref': 'refs/tags/' + release_tag, 'sha': revision})
+            elif reference['object']['type'] != 'commit' or reference['object']['sha'] != revision:
+                raise ValueError('Release tag already identifies different source')
             run(['gh', 'release', 'create', release_tag, *assets, '--repo', repository,
-                 '--target', revision, '--title', 'Release ' + revision[:12], '--notes',
+                 '--verify-tag', '--title', 'Release ' + revision[:12], '--notes',
                  'Qualified private application image. Deployment follows the existing Ansible poller.',
                  '--draft', '--latest=false'], env=gh_env)
             latest = gh.api(f'repos/{repository}/commits/main')['sha']

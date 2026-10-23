@@ -76,9 +76,13 @@ class PublicationTests(unittest.TestCase):
                     'assets': [{'id': 1, 'name': 'release.json',
                                 'digest': 'sha256:' + hashlib.sha256(data).hexdigest()}]}
         gh = FakeGitHub()
-        with patch.object(gh, 'api', side_effect=[metadata, data]) as api:
+        ref = {'object': {'type': 'commit', 'sha': revision, 'url': 'https://example.invalid/commit'}}
+        with patch.object(gh, 'api', side_effect=[metadata, ref, data]) as api:
             self.assertTrue(release.completed(gh, 'owner/app', revision, {'image': 'ghcr.io/owner/app'}))
-            self.assertEqual(api.call_count, 2)
+            self.assertEqual(api.call_count, 3)
+        with patch.object(gh, 'api', side_effect=[metadata, {'object': {'type': 'commit', 'sha': 'wrong'}}]):
+            with self.assertRaisesRegex(ValueError, 'tag does not point'):
+                release.completed(gh, 'owner/app', revision, {'image': 'ghcr.io/owner/app'})
 
     def test_credentials_do_not_follow_asset_redirects(self):
         original = urllib.request.Request('https://api.github.com/repos/owner/app/releases/assets/1',
