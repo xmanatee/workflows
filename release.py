@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """The shared local/CI publisher for private static applications (Python 3.12+)."""
 import argparse
+import fcntl
 from contextlib import contextmanager
 import hashlib
 import io
@@ -487,12 +488,15 @@ def publish(gh, repository, revision, config, output, qualifier):
             native = run(['docker', 'version', '--format', '{{.Server.Arch}}'], env=environment, capture=True).decode().strip()
             if native not in ('amd64', 'arm64'):
                 raise ValueError('A native amd64 or arm64 Docker worker is required for scanning')
-            run(['docker', 'run', '--rm', '--platform', 'linux/' + native, '--user', '65532:65532', '--cap-drop', 'ALL',
-                 '--security-opt', 'no-new-privileges', '--env', 'TRIVY_USERNAME', '--env', 'TRIVY_PASSWORD',
-                 '--mount', f'type=bind,src={cache},dst=/cache', TRIVY, 'image', '--cache-dir', '/cache',
-                 '--image-src', 'remote', '--platform', 'linux/amd64', '--scanners', 'vuln',
-                 '--disable-telemetry', '--skip-version-check', '--severity', 'HIGH,CRITICAL',
-                 '--ignore-unfixed', '--exit-code', '1', '--timeout', '15m', image], env=environment)
+            # Trivy's filesystem cache is process-exclusive, including across repositories.
+            with (CACHE / 'trivy.lock').open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                run(['docker', 'run', '--rm', '--platform', 'linux/' + native, '--user', '65532:65532', '--cap-drop', 'ALL',
+                     '--security-opt', 'no-new-privileges', '--env', 'TRIVY_USERNAME', '--env', 'TRIVY_PASSWORD',
+                     '--mount', f'type=bind,src={cache},dst=/cache', TRIVY, 'image', '--cache-dir', '/cache',
+                     '--image-src', 'remote', '--platform', 'linux/amd64', '--scanners', 'vuln',
+                     '--disable-telemetry', '--skip-version-check', '--severity', 'HIGH,CRITICAL',
+                     '--ignore-unfixed', '--exit-code', '1', '--timeout', '15m', image], env=environment)
             if config.get('channel') and revision != gh.api(f'repos/{repository}/commits/main')['sha']:
                 raise ValueError('Main advanced during qualification; release its newer revision instead')
             manifest = {'repository': repository, 'revision': revision, 'images': {'app': image},

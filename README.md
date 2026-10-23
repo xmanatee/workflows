@@ -14,6 +14,7 @@ The package manager comes from its exact `packageManager` pin. Dependencies use
 frozen installation and local stores; speech assets can reuse a verified local cache.
 Successful local builds survive a failed publication in the private artifact cache;
 retrying verifies their hashes and resumes publication. Publication removes that cache.
+Local image scans serialize access to the shared Trivy cache across repositories.
 All downloads of executable tooling have pinned versions and checksums.
 
 `.release/config.json` owns app-specific checks, output paths, licensing evidence
