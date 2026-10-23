@@ -183,14 +183,14 @@ def toolchain(root, environment):
     if manager not in ('npm', 'pnpm') or not re.fullmatch(r'\d+\.\d+\.\d+', version):
         raise ValueError('Pin npm or pnpm to an exact version')
     install = CACHE / 'tools' / (manager + '-' + version)
-    executable = install / 'node_modules' / manager / 'bin' / ('npm-cli.js' if manager == 'npm' else 'pnpm.cjs')
+    executable = install / 'node_modules/.bin' / manager
     if not executable.exists():
         install.mkdir(parents=True, exist_ok=True)
         run(['npm', 'install', '--prefix', install, '--ignore-scripts', '--no-package-lock',
              '--no-audit', '--no-fund', manager + '@' + version], cwd=install, env=environment)
     # Nested package scripts must use the same pinned manager.
     environment['PATH'] = str(install / 'node_modules/.bin') + os.pathsep + environment['PATH']
-    return ['node', str(executable)]
+    return [str(executable)]
 
 
 def scan_source(root, environment):
@@ -262,7 +262,7 @@ def verify(root, revision, repository, config, output, *, local=True):
                 if value:
                     environment[name] = value
         manager = toolchain(source, environment)
-        install = ['ci'] if manager[-1].endswith('npm-cli.js') else ['install', '--frozen-lockfile']
+        install = ['ci'] if Path(manager[0]).name == 'npm' else ['install', '--frozen-lockfile']
         run([*manager, *install], cwd=source, env=environment)
         for command in ['check', *config.get('checks', [])]:
             run([*manager, 'run', command], cwd=source, env=environment, timeout=600)
