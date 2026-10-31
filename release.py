@@ -4,6 +4,7 @@ import argparse
 import fcntl
 from contextlib import contextmanager
 import hashlib
+import html.parser
 import io
 import json
 import os
@@ -18,6 +19,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -25,7 +27,8 @@ import uuid
 
 POLICY = 1
 BASE = 'docker.io/library/nginx:1.30.6-alpine-slim@sha256:d9322bba63c6cfc63dc9e86522fd4f95fd4d9020a02b5bced282bbf38b8c3960'
-TRIVY = 'ghcr.io/aquasecurity/trivy:0.76.0@sha256:2416d1f74045b57274df1a340eee6b510cacd73c66a6ccb8da092b117eb7d222'
+TRIVY = 'ghcr.io/aquasecurity/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c'
+TRIVY_DATABASES = ('mirror.gcr.io/aquasec/trivy-db:2', 'ghcr.io/aquasecurity/trivy-db:2')
 LEAKS = {
     ('Darwin', 'arm64'): ('darwin_arm64', 'b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5'),
     ('Darwin', 'x86_64'): ('darwin_x64', 'dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709'),
@@ -280,6 +283,147 @@ def lint_workflows(root, environment):
     run([executable, *workflows], cwd=root, env=environment)
 
 
+HEAVY = re.compile(r'(?<![\w./-])(?:playwright|cypress|puppeteer|detox|maestro|xcodebuild|gradlew?)(?![\w.-])'
+                   r'|--browser|\bbench|\bstress|test:(?:e2e|integration|browser)|--suite=integration'
+                   r'|\bsimulators?\b|\bemulators?\b|expo run', re.IGNORECASE)
+TELEMETRY = ('googletagmanager', 'google-analytics', 'analytics.google.com', 'segment.io', 'segment.com',
+             '@segment/', 'mixpanel', 'posthog', 'sentry.io', '@sentry/', 'hotjar', 'clarity.ms', 'datadoghq',
+             '@datadog/', 'amplitude.com', '@amplitude/', 'amplitude-js', 'bugsnag', 'fullstory', 'logrocket',
+             'firebase/analytics', '@firebase/analytics', 'measurementid', 'appcenter', 'flurry', 'instabug')
+LOCKFILES = {'npm': 'package-lock.json', 'pnpm': 'pnpm-lock.yaml'}
+
+
+def task_text(file, task, seen):
+    """The body of one task in a tooling/tasks.mjs style table, following tasks[...] references."""
+    if task in seen or not file.is_file():
+        return ''
+    seen.add(task)
+    found = re.search(rf'^  (?:"{re.escape(task)}"|{re.escape(task)}): .*?(?=^  \S|\Z)', file.read_text(), re.M | re.S)
+    body = found.group(0) if found else ''
+    refs = re.findall(r'tasks\["([\w:.-]+)"\]|tasks\.(\w+)\(', body)
+    return ' '.join([body, *(task_text(file, a or b, seen) for a, b in refs)])
+
+
+def script_text(project, scripts, name, seen):
+    """A script's command text including package scripts and task tables it delegates to."""
+    if name in seen or name not in scripts:
+        return ''
+    seen.add(name)
+    text = scripts[name]
+    parts = [text]
+    parts += [script_text(project, scripts, ref, seen) for ref in re.findall(r'\b(?:npm|pnpm)\s+(?:run\s+)?([\w:.-]+)', text)]
+    for path, task in re.findall(r'(\S+\.mjs)\s+([\w:.-]+)', text):
+        parts.append(task_text(project / path, task, set()))
+    return ' '.join(parts)
+
+
+def conform_scripts(project, config):
+    scripts = json.loads((project / 'package.json').read_text()).get('scripts', {})
+    issues = [f'Missing package script: {name}' for name in ('check', 'build', 'check:all') if name not in scripts]
+    for name in dict.fromkeys(['check', config.get('check', 'check'), *config.get('checks', [])]):
+        found = HEAVY.search(script_text(project, scripts, name, set()))
+        if found:
+            issues.append(f'Script {name} runs heavy work ({found.group(0)}); move it to check:all')
+    if 'tools/heavy' not in scripts.get('check:all', ''):
+        issues.append('Script check:all must run through the monorepo tools/heavy admission wrapper')
+    return issues
+
+
+def conform_package(root, project, config):
+    issues = []
+    if not (root / '.nvmrc').is_file():
+        issues.append('Missing .nvmrc')
+    package = json.loads((project / 'package.json').read_text())
+    manager = re.fullmatch(r'(npm|pnpm)@\d+\.\d+\.\d+', package.get('packageManager', ''))
+    if not manager:
+        return issues + ['Pin exactly one package manager (npm or pnpm) to an exact version in packageManager']
+    manager = manager.group(1)
+    lockfiles = [name for name in ('package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb')
+                 if (project / name).exists()]
+    if lockfiles != [LOCKFILES[manager]]:
+        issues.append(f'Expected only {LOCKFILES[manager]} for {manager}, found {lockfiles}')
+    for found in [project / 'package.json', *project.glob('*/package.json'), *project.glob('packages/*/package.json'),
+                  *project.glob('apps/*/package.json')]:
+        if json.loads(found.read_text()).get('private') is not True:
+            issues.append(f'{found.relative_to(root)} must declare private: true')
+    cooldowns = {'npm': [('.npmrc', r'^min-release-age\s*=\s*[1-9]\d*\s*$')],
+                 'pnpm': [('pnpm-workspace.yaml', r'^minimumReleaseAge:\s*[1-9]\d*\s*$'),
+                          ('.npmrc', r'^minimum-release-age\s*=\s*[1-9]\d*\s*$')]}[manager]
+    if not any(re.search(pattern, (directory / name).read_text(), re.M)
+               for name, pattern in cooldowns for directory in (project, root) if (directory / name).is_file()):
+        issues.append('Configure a release-age cooldown (min-release-age or minimum-release-age in .npmrc, or minimumReleaseAge in pnpm-workspace.yaml)')
+    return issues
+
+
+def conform_release(config):
+    if not any('audit' in word for command in config.get('beforeBuild', []) for word in command):
+        return ['.release/config.json beforeBuild needs a dependency audit gate']
+    return []
+
+
+def conform_workflows(root):
+    issues = []
+    for workflow in sorted((root / '.github/workflows').glob('*.y*ml')) if (root / '.github/workflows').is_dir() else []:
+        text = workflow.read_text().lower()
+        if re.search(r'^\s*(?:schedule:|-\s*cron:)', text, re.M) and (HEAVY.search(text) or 'check:all' in text):
+            issues.append(f'{workflow.name} schedules heavy work; keep it local')
+    return issues
+
+
+def conform_nginx(root):
+    # This policy is the single declaration of what an application talks to, so it must name each origin.
+    text = (root / 'nginx.conf').read_text()
+    # Policies may live in a nginx map value, so match quoted strings rather than add_header lines.
+    policies = re.findall(r'"([^"]*(?:script-src|connect-src)[^"]*)"', text) if 'Content-Security-Policy' in text else []
+    directives = [{(d.split() or [''])[0]: d.split()[1:] for d in policy.split(';')} for policy in policies]
+    issues = []
+    for name in ('connect-src', 'script-src'):
+        if not any(name in policy for policy in directives):
+            issues.append(f'nginx.conf needs a Content-Security-Policy with {name}')
+        for policy in directives:
+            issues += [f'nginx.conf {name} allows the whole scheme or wildcard {source}' for source in policy.get(name, [])
+                       if not source.startswith("'") and source not in ('data:', 'blob:')
+                       and (source.endswith(':') or re.sub(r'^[a-z]+://', '', source) == '*')]
+    return issues
+
+
+class IndexPage(html.parser.HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.external = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        reference = attrs.get('src') if tag == 'script' else attrs.get('href') if tag == 'link' and 'stylesheet' in (attrs.get('rel') or '') else None
+        if reference and re.match(r'(?:https?:)?//', reference):
+            self.external.append(reference)
+
+
+def conform_bundle(root, config):
+    dist, root = safe_path(root, config['dist']), root.resolve()
+    issues = []
+    for path in sorted(dist.rglob('*')):
+        if path.suffix not in ('.html', '.js', '.mjs', '.css') or not path.is_file():
+            continue
+        text = path.read_text(errors='ignore')
+        lowered = text.lower()
+        issues += [f'{path.relative_to(root)} contains telemetry marker {word}' for word in TELEMETRY if word in lowered]
+        if path.name == 'index.html':
+            page = IndexPage()
+            page.feed(text)
+            issues += [f'{path.relative_to(root)} loads external {reference}' for reference in page.external]
+    return issues
+
+
+def conform(root, config):
+    """Fail unless the built application meets the monorepo standards (run after the build)."""
+    project = safe_path(root, config['workingDirectory']) if config.get('workingDirectory') else root
+    issues = [*conform_scripts(project, config), *conform_package(root, project, config), *conform_release(config),
+              *conform_workflows(root), *conform_nginx(root), *conform_bundle(root, config)]
+    if issues:
+        raise ValueError('Nonconforming application:\n' + '\n'.join(sorted(set(issues))))
+
+
 def verify(root, revision, repository, config, output, *, local=True):
     environment = {**os.environ, **config.get('environment', {}), **SAFE_ENV, 'SOURCE_REVISION': revision}
     # Verification never receives publisher credentials, including through gh's keychain.
@@ -318,6 +462,7 @@ def verify(root, revision, repository, config, output, *, local=True):
         for relative in config['required']:
             if not safe_path(source, relative).is_file() or not safe_path(source, relative).stat().st_size:
                 raise ValueError('Required build output missing: ' + relative)
+        conform(source, config)
         shutil.copytree(safe_path(source, config['dist']), output / 'site')
         shutil.copyfile(source / 'nginx.conf', output / 'nginx.conf')
         for relative in config.get('evidence', []):
@@ -435,6 +580,19 @@ def image_context(output, context, immutable_directories=()):
     return '\n'.join(lines) + '\n'
 
 
+def refresh_scanner_database(scanner, environment):
+    # Trivy tries its next repository only after a registry's temporary error, not after a failed download.
+    for attempt in range(1, 4):
+        for repository in TRIVY_DATABASES:
+            try:
+                return run([*scanner, '--download-db-only', '--db-repository', repository, '--no-progress',
+                            '--timeout', '5m'], env=environment)
+            except RuntimeError:
+                pass
+        time.sleep(attempt * 30)
+    raise RuntimeError('No repository served the vulnerability database. This is not a security finding; rerun the release.')
+
+
 def scan_image(image, private, environment):
     # Export the selected digest once; the scanner gets no registry or Docker socket access.
     archive = private / 'image.tar'
@@ -446,16 +604,16 @@ def scan_image(image, private, environment):
     native = run(['docker', 'version', '--format', '{{.Server.Arch}}'], env=environment, capture=True).decode().strip()
     if native not in ('amd64', 'arm64'):
         raise ValueError('A native amd64 or arm64 Docker worker is required for scanning')
+    container = ['docker', 'run', '--rm', '--platform', 'linux/' + native, '--user', '65532:65532', '--cap-drop', 'ALL',
+                 '--security-opt', 'no-new-privileges', '--mount', f'type=bind,src={cache},dst=/cache']
+    scanner = ['image', '--cache-dir', '/cache', '--disable-telemetry', '--skip-version-check']
     # Trivy's filesystem cache is process-exclusive, including across repositories.
     with (CACHE / 'trivy.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        run(['docker', 'run', '--rm', '--platform', 'linux/' + native, '--user', '65532:65532', '--cap-drop', 'ALL',
-             '--security-opt', 'no-new-privileges',
-             '--mount', f'type=bind,src={cache},dst=/cache',
-             '--mount', f'type=bind,src={archive},dst=/scan/image.tar,readonly',
-             TRIVY, 'image', '--cache-dir', '/cache', '--input', '/scan/image.tar', '--platform', 'linux/amd64',
-             '--scanners', 'vuln', '--disable-telemetry', '--skip-version-check', '--severity', 'HIGH,CRITICAL',
-             '--ignore-unfixed', '--exit-code', '1', '--timeout', '15m'], env=environment)
+        refresh_scanner_database([*container, TRIVY, *scanner], environment)
+        run([*container, '--mount', f'type=bind,src={archive},dst=/scan/image.tar,readonly', TRIVY, *scanner,
+             '--skip-db-update', '--input', '/scan/image.tar', '--platform', 'linux/amd64', '--scanners', 'vuln',
+             '--severity', 'HIGH,CRITICAL', '--ignore-unfixed', '--exit-code', '1', '--timeout', '15m'], env=environment)
 
 
 def publish(gh, repository, revision, config, output, qualifier):
@@ -545,7 +703,7 @@ def publish(gh, repository, revision, config, output, qualifier):
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=['deploy', 'status', 'verify', 'publish'], nargs='?', default='deploy')
+    parser.add_argument('operation', choices=['deploy', 'status', 'verify', 'publish', 'conform'], nargs='?', default='deploy')
     parser.add_argument('--root', type=Path, default=Path.cwd())
     parser.add_argument('--artifact', type=Path)
     parser.add_argument('--qualifier', default=os.environ.get('RELEASE_QUALIFIER'))
@@ -555,6 +713,9 @@ def main():
         if settings.exists():
             options.qualifier = json.loads(settings.read_text()).get('qualifier')
     root = options.root.resolve()
+    if options.operation == 'conform':
+        # Checks the working tree and its existing build output; it needs no GitHub access.
+        return conform(root, json.loads((root / '.release/config.json').read_text()))
     revision = git(root, 'rev-parse', 'HEAD')
     pin = re.search(r'^SHA256 = "([a-f0-9]{64})"$',
                     git(root, 'show', revision + ':.release/deploy.py'), re.MULTILINE)

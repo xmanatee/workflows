@@ -56,7 +56,23 @@ class PublicationTests(unittest.TestCase):
             self.assertEqual(scanner[scanner.index('--exit-code') + 1], '1')
             self.assertNotIn('--image-src', scanner)
             self.assertNotIn('TRIVY_PASSWORD', scanner)
+            self.assertIn('--skip-db-update', scanner)
             lock.assert_called_once()
+
+    def test_scanner_database_falls_back_after_a_failed_download_and_never_reads_as_a_finding(self):
+        attempts = []
+        def run(arguments, **kwargs):
+            attempts.append(arguments[arguments.index('--db-repository') + 1])
+            if len(attempts) == 1:
+                raise RuntimeError('docker failed (exit 1)')
+        with patch.object(release, 'run', side_effect=run):
+            release.refresh_scanner_database(['trivy'], {})
+        self.assertEqual(attempts, list(release.TRIVY_DATABASES))
+        with patch.object(release, 'run', side_effect=RuntimeError('docker failed (exit 1)')), \
+                patch.object(release.time, 'sleep') as sleep, \
+                self.assertRaisesRegex(RuntimeError, 'not a security finding'):
+            release.refresh_scanner_database(['trivy'], {})
+        self.assertEqual(sleep.call_count, 3)
 
     def test_image_layers_preserve_all_files_and_normalize_cold_build_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -250,6 +266,103 @@ class PublicationTests(unittest.TestCase):
                 archive.addfile(member, io.BytesIO(b''))
             with self.assertRaises(tarfile.FilterError):
                 release.unpack(data.getvalue(), root)
+
+
+CONFIG = {'dist': 'dist', 'beforeBuild': [['audit']]}
+NGINX = 'add_header Content-Security-Policy "script-src \'self\'; connect-src \'self\' https://api.example.org";'
+
+
+class ConformTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.write('package.json', json.dumps({'private': True, 'packageManager': 'npm@12.2.0', 'scripts': {
+            'check': 'tsc', 'build': 'vite build', 'check:all': 'python3 ../../tools/heavy -- npm run check'}}))
+        self.write('package-lock.json', '{}')
+        self.write('.nvmrc', '22.23.4')
+        self.write('.npmrc', 'min-release-age=7\n')
+        self.write('nginx.conf', NGINX)
+        self.write('dist/index.html', '<script src="/assets/a.js"></script><link rel="stylesheet" href="/a.css">')
+        self.write('dist/assets/a.js', 'fetch("https://api.example.org/x");"http://www.w3.org/2000/svg"')
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def write(self, name, text):
+        (self.root / name).parent.mkdir(parents=True, exist_ok=True)
+        (self.root / name).write_text(text)
+
+    def scripts(self, **changes):
+        package = json.loads((self.root / 'package.json').read_text())
+        package['scripts'].update(changes)
+        self.write('package.json', json.dumps(package))
+
+    def test_a_conforming_application_passes(self):
+        release.conform(self.root, CONFIG)
+
+    def test_required_scripts_and_the_heavy_wrapper(self):
+        self.write('package.json', json.dumps({'private': True, 'packageManager': 'npm@12.2.0', 'scripts': {'check': 'tsc'}}))
+        issues = release.conform_scripts(self.root, CONFIG)
+        self.assertIn('Missing package script: build', issues)
+        self.assertTrue(any('tools/heavy' in issue for issue in issues))
+
+    def test_check_may_not_reach_browsers_even_through_delegated_scripts(self):
+        self.scripts(check='npm run verify', verify='playwright test')
+        self.assertTrue(any('playwright' in issue for issue in release.conform_scripts(self.root, CONFIG)))
+        self.write('tooling/tasks.mjs', 'const tasks = {\n  check: () => {\n    tasks["test:e2e"]();\n  },\n'
+                   '  "test:e2e": () => exec("playwright"),\n  other: () => {},\n};\n')
+        self.scripts(check='node tooling/tasks.mjs check')
+        self.assertTrue(any('e2e' in issue for issue in release.conform_scripts(self.root, CONFIG)))
+        self.write('tooling/tasks.mjs', 'const tasks = {\n  check: () => lint(),\n  "test:e2e": () => exec("playwright"),\n};\n')
+        self.assertEqual(release.conform_scripts(self.root, CONFIG), [])
+
+    def test_package_manager_toolchain_and_cooldown(self):
+        self.write('pnpm-lock.yaml', '')
+        (self.root / '.nvmrc').unlink()
+        (self.root / '.npmrc').write_text('min-release-age=0\n')
+        self.assertEqual(len(release.conform_package(self.root, self.root, CONFIG)), 3)
+        self.write('package.json', json.dumps({'packageManager': 'npm@12', 'scripts': {}}))
+        self.assertTrue(release.conform_package(self.root, self.root, CONFIG)[-1].startswith('Pin exactly one'))
+
+    def test_pnpm_cooldown_and_private_workspace_packages(self):
+        self.write('package.json', json.dumps({'private': True, 'packageManager': 'pnpm@10.34.7', 'scripts': {}}))
+        (self.root / 'package-lock.json').rename(self.root / 'pnpm-lock.yaml')
+        self.write('packages/a/package.json', '{}')
+        self.write('pnpm-workspace.yaml', 'minimumReleaseAge: 10080\n')
+        self.assertEqual(release.conform_package(self.root, self.root, CONFIG), ['packages/a/package.json must declare private: true'])
+        (self.root / 'pnpm-workspace.yaml').unlink()
+        self.write('packages/a/package.json', '{"private": true}')
+        self.assertEqual(len(release.conform_package(self.root, self.root, CONFIG)), 1)
+        self.write('.npmrc', 'minimum-release-age=10080\n')
+        self.assertEqual(release.conform_package(self.root, self.root, CONFIG), [])
+
+    def test_audit_gate_and_scheduled_heavy_workflows(self):
+        self.assertEqual(len(release.conform_release({})), 1)
+        self.assertEqual(release.conform_release({'beforeBuild': [['exec', 'node', 'scripts/audit-dependencies.mjs']]}), [])
+        self.write('.github/workflows/nightly.yml', 'on:\n  schedule:\n    - cron: "0 3 * * *"\njobs:\n  x:\n    run: npm run check:all\n')
+        self.assertEqual(len(release.conform_workflows(self.root)), 1)
+        self.write('.github/workflows/nightly.yml', 'on:\n  schedule:\n    - cron: "0 3 * * *"\njobs:\n  x:\n    run: npm audit\n')
+        self.assertEqual(release.conform_workflows(self.root), [])
+
+    def test_bundle_rejects_telemetry_and_external_assets_but_not_a_mentioned_url(self):
+        self.write('dist/assets/b.js', 'a="https://o1.ingest.sentry.io/1";b="https://docs.example.net/p"')
+        self.write('dist/index.html', '<link rel="stylesheet" href="https://fonts.googleapis.com/css"><script src="//cdn.test/x.js"></script>')
+        issues = '\n'.join(release.conform_bundle(self.root, CONFIG))
+        for expected in ('sentry.io', 'fonts.googleapis.com', '//cdn.test/x.js'):
+            self.assertIn(expected, issues)
+        for mentioned in ('www.w3.org', 'api.example.org', 'docs.example.net'):
+            self.assertNotIn(mentioned, issues)
+
+    def test_nginx_policy_names_each_origin(self):
+        self.assertEqual(release.conform_nginx(self.root), [])
+        for source in ('https:', 'wss:', '*', 'https://*'):
+            with self.subTest(source=source):
+                self.write('nginx.conf', f'add_header Content-Security-Policy "script-src \'self\' \'unsafe-inline\'; connect-src \'self\' data: {source}";')
+                self.assertEqual(release.conform_nginx(self.root), [f'nginx.conf connect-src allows the whole scheme or wildcard {source}'])
+        self.write('nginx.conf', 'add_header Content-Security-Policy "connect-src \'self\' wss://other.test";')
+        self.assertEqual(release.conform_nginx(self.root), ['nginx.conf needs a Content-Security-Policy with script-src'])
+        self.write('nginx.conf', 'server {}')
+        self.assertEqual(len(release.conform_nginx(self.root)), 2)
 
 
 if __name__ == '__main__':
