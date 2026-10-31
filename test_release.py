@@ -353,6 +353,13 @@ class ConformTests(unittest.TestCase):
         for mentioned in ('www.w3.org', 'api.example.org', 'docs.example.net'):
             self.assertNotIn(mentioned, issues)
 
+    def test_firebase_naming_its_sdks_is_not_analytics_but_the_sdk_is(self):
+        self.write('dist/index.html', '<script src="/assets/b.js"></script>')
+        self.write('dist/assets/b.js', 'r={"@firebase/analytics":"fire-analytics"}')
+        self.assertEqual(release.conform_bundle(self.root, CONFIG), [])
+        self.write('dist/assets/b.js', 'u="https://www.googletagmanager.com/gtag/js"')
+        self.assertIn('googletagmanager', '\n'.join(release.conform_bundle(self.root, CONFIG)))
+
     def test_nginx_policy_names_each_origin(self):
         self.assertEqual(release.conform_nginx(self.root), [])
         for source in ('https:', 'wss:', '*', 'https://*'):

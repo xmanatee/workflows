@@ -289,7 +289,7 @@ HEAVY = re.compile(r'(?<![\w./-])(?:playwright|cypress|puppeteer|detox|maestro|x
 TELEMETRY = ('googletagmanager', 'google-analytics', 'analytics.google.com', 'segment.io', 'segment.com',
              '@segment/', 'mixpanel', 'posthog', 'sentry.io', '@sentry/', 'hotjar', 'clarity.ms', 'datadoghq',
              '@datadog/', 'amplitude.com', '@amplitude/', 'amplitude-js', 'bugsnag', 'fullstory', 'logrocket',
-             'firebase/analytics', '@firebase/analytics', 'measurementid', 'appcenter', 'flurry', 'instabug')
+             'measurementid', 'appcenter', 'flurry', 'instabug')
 LOCKFILES = {'npm': 'package-lock.json', 'pnpm': 'pnpm-lock.yaml'}
 
 
