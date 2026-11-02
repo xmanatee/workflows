@@ -360,16 +360,45 @@ class ConformTests(unittest.TestCase):
         self.write('dist/assets/b.js', 'u="https://www.googletagmanager.com/gtag/js"')
         self.assertIn('googletagmanager', '\n'.join(release.conform_bundle(self.root, CONFIG)))
 
+    def test_custom_https_api_endpoints_need_an_explicit_boolean_capability(self):
+        self.write('nginx.conf', 'add_header Content-Security-Policy "script-src \'self\'; connect-src \'self\' https:";')
+        release.conform(self.root, {**CONFIG, 'customApiEndpoints': True})
+        for config in (CONFIG, {**CONFIG, 'customApiEndpoints': False}):
+            with self.subTest(config=config), self.assertRaisesRegex(ValueError, 'connect-src.*https:'):
+                release.conform(self.root, config)
+        for value in ('true', 1, None, []):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'customApiEndpoints must be a boolean'):
+                release.conform(self.root, {**CONFIG, 'customApiEndpoints': value})
+
+    def test_custom_api_capability_does_not_allow_other_schemes_scripts_or_wildcards(self):
+        config = {**CONFIG, 'customApiEndpoints': True}
+        for directive, source in [('script-src', 'https:'), ('script-src', 'http:'),
+                ('script-src', 'wss:'), ('script-src', 'https://*'), ('script-src', '*'),
+                ('connect-src', 'http:'), ('connect-src', 'wss:'),
+                ('connect-src', 'https://*'), ('connect-src', '*')]:
+            policy = {'script-src': "'self'", 'connect-src': "'self' https:"}
+            policy[directive] += ' ' + source
+            self.write('nginx.conf', 'add_header Content-Security-Policy "' +
+                       '; '.join(name + ' ' + sources for name, sources in policy.items()) + '";')
+            with self.subTest(directive=directive, source=source), self.assertRaisesRegex(ValueError, directive):
+                release.conform(self.root, config)
+
+    def test_custom_api_capability_keeps_telemetry_rejection(self):
+        self.write('nginx.conf', 'add_header Content-Security-Policy "script-src \'self\'; connect-src \'self\' https:";')
+        self.write('dist/assets/b.js', 'u="https://o1.ingest.sentry.io/1"')
+        with self.assertRaisesRegex(ValueError, 'telemetry marker sentry.io'):
+            release.conform(self.root, {**CONFIG, 'customApiEndpoints': True})
+
     def test_nginx_policy_names_each_origin(self):
-        self.assertEqual(release.conform_nginx(self.root), [])
+        self.assertEqual(release.conform_nginx(self.root, CONFIG), [])
         for source in ('https:', 'wss:', '*', 'https://*'):
             with self.subTest(source=source):
                 self.write('nginx.conf', f'add_header Content-Security-Policy "script-src \'self\' \'unsafe-inline\'; connect-src \'self\' data: {source}";')
-                self.assertEqual(release.conform_nginx(self.root), [f'nginx.conf connect-src allows the whole scheme or wildcard {source}'])
+                self.assertEqual(release.conform_nginx(self.root, CONFIG), [f'nginx.conf connect-src allows the whole scheme or wildcard {source}'])
         self.write('nginx.conf', 'add_header Content-Security-Policy "connect-src \'self\' wss://other.test";')
-        self.assertEqual(release.conform_nginx(self.root), ['nginx.conf needs a Content-Security-Policy with script-src'])
+        self.assertEqual(release.conform_nginx(self.root, CONFIG), ['nginx.conf needs a Content-Security-Policy with script-src'])
         self.write('nginx.conf', 'server {}')
-        self.assertEqual(len(release.conform_nginx(self.root)), 2)
+        self.assertEqual(len(release.conform_nginx(self.root, CONFIG)), 2)
 
 
 if __name__ == '__main__':

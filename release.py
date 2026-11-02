@@ -370,19 +370,21 @@ def conform_workflows(root):
     return issues
 
 
-def conform_nginx(root):
-    # This policy is the single declaration of what an application talks to, so it must name each origin.
+def conform_nginx(root, config):
+    # User-configured HTTPS APIs are an explicit capability; other origins stay named.
     text = (root / 'nginx.conf').read_text()
     # Policies may live in a nginx map value, so match quoted strings rather than add_header lines.
     policies = re.findall(r'"([^"]*(?:script-src|connect-src)[^"]*)"', text) if 'Content-Security-Policy' in text else []
     directives = [{(d.split() or [''])[0]: d.split()[1:] for d in policy.split(';')} for policy in policies]
-    issues = []
+    custom_api_endpoints = config.get('customApiEndpoints', False)
+    issues = [] if isinstance(custom_api_endpoints, bool) else ['.release/config.json customApiEndpoints must be a boolean']
     for name in ('connect-src', 'script-src'):
         if not any(name in policy for policy in directives):
             issues.append(f'nginx.conf needs a Content-Security-Policy with {name}')
         for policy in directives:
             issues += [f'nginx.conf {name} allows the whole scheme or wildcard {source}' for source in policy.get(name, [])
                        if not source.startswith("'") and source not in ('data:', 'blob:')
+                       and not (name == 'connect-src' and source == 'https:' and custom_api_endpoints is True)
                        and (source.endswith(':') or re.sub(r'^[a-z]+://', '', source) == '*')]
     return issues
 
@@ -419,7 +421,7 @@ def conform(root, config):
     """Fail unless the built application meets the monorepo standards (run after the build)."""
     project = safe_path(root, config['workingDirectory']) if config.get('workingDirectory') else root
     issues = [*conform_scripts(project, config), *conform_package(root, project, config), *conform_release(config),
-              *conform_workflows(root), *conform_nginx(root), *conform_bundle(root, config)]
+              *conform_workflows(root), *conform_nginx(root, config), *conform_bundle(root, config)]
     if issues:
         raise ValueError('Nonconforming application:\n' + '\n'.join(sorted(set(issues))))
 
