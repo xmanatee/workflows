@@ -19,9 +19,17 @@ All downloads of executable tooling have pinned versions and checksums.
 
 `.release/config.json` owns app-specific checks, output paths, licensing evidence
 and the private image name. `.release/deploy.py` pins this publisher by commit and
-checksum. Local and optional manual GitHub releases call the same implementation.
+checksum. Local releases and main-branch push/manual GitHub releases call the same implementation.
 Verification has read-only access; only the separate publication job gets writes. Hosted publication accepts only main-branch pushes or manual runs.
 Heavy local `check:all` suites are not release defaults.
+
+The config's `audit` argv is the dependency gate for both release verification
+and `python3 .release/deploy.py audit`. Daily scheduled callers run that gate
+against the committed lockfile with the pinned manager, without installing app
+dependencies, building, publishing or reading provider/publisher credentials.
+An existing immutable release never skips this audit. Dependency fixes remain
+reviewed source changes: update compatible packages and their owning lockfile,
+then qualify the main-branch commit through the normal publisher.
 
 Repositories containing separately operated products can declare `sourceInputs`
 as committed files/directories for this product's build context. The publisher

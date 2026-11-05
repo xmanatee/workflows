@@ -356,8 +356,11 @@ def conform_package(root, project, config):
 
 
 def conform_release(config):
-    if not any('audit' in word for command in config.get('beforeBuild', []) for word in command):
-        return ['.release/config.json beforeBuild needs a dependency audit gate']
+    command = config.get('audit')
+    if (not isinstance(command, list) or not command
+            or not all(isinstance(word, str) and word for word in command)
+            or not any('audit' in word for word in command)):
+        return ['.release/config.json audit must name the dependency audit command']
     return []
 
 
@@ -426,6 +429,24 @@ def conform(root, config):
         raise ValueError('Nonconforming application:\n' + '\n'.join(sorted(set(issues))))
 
 
+def audit(root, revision, config):
+    """Audit the committed lockfile even when this revision already has a release."""
+    issues = conform_release(config)
+    if issues:
+        raise ValueError('\n'.join(issues))
+    with tempfile.TemporaryDirectory(prefix='app-audit-') as temporary:
+        source = Path(temporary)
+        environment = {**os.environ, **config.get('environment', {}), **SAFE_ENV,
+                       'GH_CONFIG_DIR': str(source / 'no-github-credentials')}
+        for key in ('GH_TOKEN', 'GITHUB_TOKEN', 'ACTIONS_RUNTIME_TOKEN',
+                    'OPENAI_API_KEY', 'ELEVENLABS_API_KEY', 'HOL_UNLOCK_CODE'):
+            environment.pop(key, None)
+        archive_source(root, revision, source, config.get('submodules', []), config.get('sourceInputs', []))
+        project = safe_path(source, config['workingDirectory']) if config.get('workingDirectory') else source
+        manager = toolchain(source, environment, project)
+        run([*manager, *config['audit']], cwd=project, env=environment, timeout=180)
+
+
 def verify(root, revision, repository, config, output, *, local=True):
     environment = {**os.environ, **config.get('environment', {}), **SAFE_ENV, 'SOURCE_REVISION': revision}
     # Verification never receives publisher credentials, including through gh's keychain.
@@ -458,6 +479,7 @@ def verify(root, revision, repository, config, output, *, local=True):
         run([*manager, *install], cwd=project, env=environment)
         for command in [config.get('check', 'check'), *config.get('checks', [])]:
             run([*manager, 'run', command], cwd=project, env=environment, timeout=600)
+        run([*manager, *config['audit']], cwd=project, env=environment, timeout=180)
         for command in config.get('beforeBuild', []):
             run([*manager, *command], cwd=project, env=environment)
         run([*manager, 'run', config.get('build', 'build')], cwd=project, env=environment)
@@ -480,6 +502,9 @@ def verify(root, revision, repository, config, output, *, local=True):
 # neither the local GitHub session nor provider build secrets are transmitted.
 ACCEPT = r'''
 import hashlib,json,os,pathlib,platform,signal,subprocess,sys,tempfile,time,urllib.request,uuid
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+ def redirect_request(self,*args,**kwargs): return None
+client=urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect())
 image,checks=sys.argv[1],json.loads(sys.argv[2])
 assert platform.machine()=='x86_64', 'Native amd64 qualification is required'
 for sig in (signal.SIGTERM,signal.SIGHUP): signal.signal(sig,lambda *_: sys.exit(143))
@@ -502,8 +527,11 @@ with tempfile.TemporaryDirectory(prefix='app-acceptance-') as private:
    request=urllib.request.Request('http://127.0.0.1:'+port+check['path'],headers={'Host':check.get('host','localhost')})
    for attempt in range(30):
     try:
-     with urllib.request.urlopen(request,timeout=3) as response: data=response.read()
+     with client.open(request,timeout=3) as response: data=response.read()
      break
+    except urllib.error.HTTPError as error:
+     error.close()
+     raise
     except OSError:
      if attempt==29: raise
      time.sleep(1)
@@ -705,7 +733,7 @@ def publish(gh, repository, revision, config, output, qualifier):
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=['deploy', 'status', 'verify', 'publish', 'conform'], nargs='?', default='deploy')
+    parser.add_argument('operation', choices=['deploy', 'status', 'verify', 'publish', 'conform', 'audit'], nargs='?', default='deploy')
     parser.add_argument('--root', type=Path, default=Path.cwd())
     parser.add_argument('--artifact', type=Path)
     parser.add_argument('--qualifier', default=os.environ.get('RELEASE_QUALIFIER'))
@@ -724,6 +752,8 @@ def main():
     if not pin or pin.group(1) != digest(Path(__file__)):
         raise ValueError('Publisher does not match the committed deploy command pin')
     config = json.loads(git(root, 'show', revision + ':.release/config.json'))
+    if options.operation == 'audit':
+        return audit(root, revision, config)
     repository = config['repository']
     gh = GitHub()
     if not gh.api(f'repos/{repository}')['private'] and not config.get('allowPublicSource'):

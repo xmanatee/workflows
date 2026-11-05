@@ -1,8 +1,13 @@
 import hashlib
+import http.server
 import io
 import json
 from pathlib import Path
 import tarfile
+import threading
+import sys
+import signal
+import time
 import tempfile
 import unittest
 import urllib.request
@@ -248,6 +253,53 @@ class PublicationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'tag does not point'):
                 release.completed(gh, 'owner/app', revision, {'image': 'ghcr.io/owner/app'})
 
+    def test_native_smoke_cannot_follow_redirects_or_environment_proxies(self):
+        body = b'verified site'
+        requests = []
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append(self.path)
+                self.send_response(302 if self.path == '/redirect' else 200)
+                if self.path == '/redirect':
+                    self.send_header('Location', '/escape')
+                self.end_headers()
+                self.wfile.write(body)
+            def log_message(self, *_):
+                pass
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        port = server.server_address[1]
+        def accept(path, selected_port=port, proxy=False):
+            def docker(args, **kwargs):
+                output = f'127.0.0.1:{selected_port}\n'.encode() if args[1] == 'port' else b''
+                return subprocess.CompletedProcess(args, 0, output)
+            checks = [{'path': path, 'sha256': hashlib.sha256(body).hexdigest()}]
+            environment = {'http_proxy': f'http://127.0.0.1:{port}'} if proxy else {}
+            with patch.object(subprocess, 'run', side_effect=docker), \
+                    patch.object(release.platform, 'machine', return_value='x86_64'), \
+                    patch.object(signal, 'signal'), patch.object(time, 'sleep'), \
+                    patch.object(sys, 'argv', ['accept', 'fixture@sha256:abc', json.dumps(checks)]), \
+                    patch.dict(release.os.environ, environment, clear=True), \
+                    patch.object(urllib.request, '_opener', None):
+                exec(compile(release.ACCEPT, '<native smoke>', 'exec'), {})
+        accept('/')
+        self.assertEqual(requests, ['/'])
+        requests.clear()
+        with self.subTest('redirect'), self.assertRaises(urllib.error.HTTPError):
+            accept('/redirect')
+        with self.subTest('redirect target'):
+            self.assertNotIn('/escape', requests)
+        requests.clear()
+        # The origin is closed; a matching response from the configured proxy must fail.
+        with self.subTest('proxy'), self.assertRaises(urllib.error.URLError):
+            accept('/', selected_port=0, proxy=True)
+        with self.subTest('proxy target'):
+            self.assertEqual(requests, [])
+
     def test_credentials_do_not_follow_asset_redirects(self):
         original = urllib.request.Request('https://api.github.com/repos/owner/app/releases/assets/1',
                                           headers={'Authorization': 'Bearer fixture'})
@@ -268,7 +320,54 @@ class PublicationTests(unittest.TestCase):
                 release.unpack(data.getvalue(), root)
 
 
-CONFIG = {'dist': 'dist', 'beforeBuild': [['audit']]}
+class AuditTests(unittest.TestCase):
+    def test_schedule_audits_committed_locks_every_time_without_publisher_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'repository'
+            (root / '.release').mkdir(parents=True)
+            (root / '.release/config.json').write_text(json.dumps({'repository': 'owner/app', 'audit': ['audit']}))
+            (root / '.release/deploy.py').write_text('SHA256 = "' + release.digest(Path(release.__file__)) + '"\n')
+            (root / 'locked.txt').write_text('vulnerable')
+            (root / 'manager.py').write_text("""import os,sys
+from pathlib import Path
+assert sys.argv[1:] == ['audit'], 'Only the audit may run'
+assert not any(os.environ.get(key) for key in ('GH_TOKEN','GITHUB_TOKEN','ACTIONS_RUNTIME_TOKEN',
+    'OPENAI_API_KEY','ELEVENLABS_API_KEY','HOL_UNLOCK_CODE'))
+assert not Path(os.environ['GH_CONFIG_DIR']).exists()
+if Path('locked.txt').read_text() != 'fixed': sys.exit(9)
+with Path(os.environ['AUDIT_MARKER']).open('a') as marker: marker.write('audit\\n')
+""")
+            def git(*args):
+                subprocess.run(['git', '-C', root, '-c', 'user.name=Fixture',
+                    '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false', *args],
+                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            git('init')
+            git('add', '.')
+            git('commit', '-m', 'Commit vulnerable lockfile')
+            # An uncommitted fix must not hide a finding in the committed dependency graph.
+            (root / 'locked.txt').write_text('fixed')
+            marker = Path(directory) / 'audits'
+            def toolchain(source, *_):
+                return [sys.executable, str(source / 'manager.py')]
+            previous_umask = release.os.umask(0o077)
+            self.addCleanup(release.os.umask, previous_umask)
+            with patch.object(sys, 'argv', ['release', 'audit', '--root', str(root)]), \
+                    patch.object(release, 'toolchain', side_effect=toolchain), \
+                    patch.object(release, 'GitHub', side_effect=AssertionError('Audit must not access GitHub')), \
+                    patch.dict(release.os.environ, {'GH_TOKEN': 'fixture', 'GITHUB_TOKEN': 'fixture',
+                        'ACTIONS_RUNTIME_TOKEN': 'fixture', 'OPENAI_API_KEY': 'fixture',
+                        'ELEVENLABS_API_KEY': 'fixture', 'HOL_UNLOCK_CODE': 'fixture', 'AUDIT_MARKER': str(marker)}):
+                with self.assertRaisesRegex(RuntimeError, 'exit 9'):
+                    release.main()
+                self.assertFalse(marker.exists())
+                git('add', 'locked.txt')
+                git('commit', '-m', 'Qualify fixed lockfile')
+                release.main()
+                release.main()
+            self.assertEqual(marker.read_text().splitlines(), ['audit', 'audit'])
+
+
+CONFIG = {'dist': 'dist', 'audit': ['audit']}
 NGINX = 'add_header Content-Security-Policy "script-src \'self\'; connect-src \'self\' https://api.example.org";'
 
 
@@ -338,7 +437,7 @@ class ConformTests(unittest.TestCase):
 
     def test_audit_gate_and_scheduled_heavy_workflows(self):
         self.assertEqual(len(release.conform_release({})), 1)
-        self.assertEqual(release.conform_release({'beforeBuild': [['exec', 'node', 'scripts/audit-dependencies.mjs']]}), [])
+        self.assertEqual(release.conform_release({'audit': ['exec', 'node', 'scripts/audit-dependencies.mjs']}), [])
         self.write('.github/workflows/nightly.yml', 'on:\n  schedule:\n    - cron: "0 3 * * *"\njobs:\n  x:\n    run: npm run check:all\n')
         self.assertEqual(len(release.conform_workflows(self.root)), 1)
         self.write('.github/workflows/nightly.yml', 'on:\n  schedule:\n    - cron: "0 3 * * *"\njobs:\n  x:\n    run: npm audit\n')
