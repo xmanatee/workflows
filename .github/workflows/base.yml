@@ -1,0 +1,54 @@
+name: Application base image
+on:
+  schedule:
+    - cron: '37 4 * * *'
+    - cron: '7 4 * * 3'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: base-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  scan:
+    if: github.event.schedule != '7 4 * * 3'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Scan the pinned nginx base for fixable high and critical vulnerabilities
+        run: python3 release.py scan-base
+  refresh:
+    if: github.ref == 'refs/heads/main' && github.event.schedule == '7 4 * * 3'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      base: ${{ steps.refresh.outputs.base }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - id: refresh
+        name: Scan and test the newest cooled-down patch of the pinned nginx line
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 release.py refresh-base
+  adopt:
+    needs: refresh
+    if: needs.refresh.outputs.base != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Commit the qualified base pin and request publisher CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ needs.refresh.outputs.base }}
+        run: python3 release.py apply-base --base "$BASE"

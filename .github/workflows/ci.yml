@@ -7,7 +7,7 @@ permissions:
   contents: read
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 jobs:
   verify:
     runs-on: ubuntu-24.04
@@ -27,8 +27,39 @@ jobs:
           python3 - <<'PY'
           import os
           from pathlib import Path
+          import tempfile
           import release
           environment = {**os.environ, **release.SAFE_ENV}
           release.scan_source(Path.cwd(), environment)
           release.lint_workflows(Path.cwd(), environment)
+          with tempfile.TemporaryDirectory() as directory:
+              application = Path(directory)
+              (application / release.WORKFLOW).parent.mkdir(parents=True)
+              (application / release.WORKFLOW).write_text(release.TEMPLATE)
+              release.lint_workflows(application, environment)
           PY
+  release:
+    needs: verify
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Publish the immutable publisher release applications adopt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="publisher-$GITHUB_SHA"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "$tag exists"
+            exit 0
+          fi
+          python3 -c 'import pathlib, release, sys; sys.stdout.write(release.publisher_manifest(sys.argv[1], pathlib.Path("release.py").read_bytes()))' \
+            "$GITHUB_SHA" > "$RUNNER_TEMP/publisher.json"
+          gh release create "$tag" "$RUNNER_TEMP/publisher.json" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Publisher ${GITHUB_SHA:0:12}" --notes 'Verified publisher; applications adopt it weekly.' --draft --latest=false
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest
