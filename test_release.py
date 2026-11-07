@@ -431,6 +431,10 @@ class ToolCacheTests(unittest.TestCase):
         self.served = self.tarball
 
     def urlopen(self, url, timeout):
+        if url == 'https://registry.npmjs.org/pnpm/11.1.0':
+            return io.BytesIO(json.dumps({'name': 'pnpm', 'version': '11.1.0', 'dist': {
+                'tarball': 'https://registry.npmjs.org/pnpm/-/pnpm-11.1.0.tgz',
+                'integrity': self.integrity}}).encode())
         self.downloads.append(url)
         return io.BytesIO(self.served)
 
@@ -438,13 +442,16 @@ class ToolCacheTests(unittest.TestCase):
         args = [str(argument) for argument in args]
         if args[:2] == ['node', '--version']:
             return b'v24.0.0\n'
-        if args[:2] == ['npm', 'view']:
-            return json.dumps({'dist.tarball': 'https://registry.npmjs.org/pnpm/-/pnpm-11.1.0.tgz',
-                               'dist.integrity': self.integrity}).encode()
         if args[:2] == ['npm', 'install']:
+            self.assertNotIn('--offline', args)
+            self.assertIn('--include=optional', args)
+            self.assertNotEqual(env['npm_config_cache'], str(self.cache))
+            self.assertEqual(env['npm_config_ignore_scripts'], 'false')
             self.installs.append(Path(args[-1]).read_bytes())
             prefix = Path(args[args.index('--prefix') + 1])
             self.assertEqual(sorted(path.name for path in prefix.iterdir()), ['package.json'])
+            self.assertEqual(json.loads((prefix / 'package.json').read_text())['allowScripts'],
+                             {'file:' + str(self.cache / 'tools/pnpm-11.1.0.tgz'): True})
             (prefix / 'node_modules/.bin').mkdir(parents=True)
             (prefix / 'node_modules/.bin/pnpm').write_text('installed from the verified tarball')
             return b''
@@ -452,7 +459,7 @@ class ToolCacheTests(unittest.TestCase):
 
     def toolchain(self):
         with patch.object(release, 'run', side_effect=self.command), patch('urllib.request.urlopen', side_effect=self.urlopen):
-            return release.toolchain(self.root, {'PATH': '/usr/bin'})
+            return release.toolchain(self.root, {'PATH': '/usr/bin', 'npm_config_ignore_scripts': 'true'})
 
     def test_the_manager_is_reinstalled_from_a_tarball_matching_the_registry_integrity(self):
         executable, = self.toolchain()
@@ -501,6 +508,21 @@ class ToolCacheTests(unittest.TestCase):
         audit = re.search(r'^  audit:\n(.*?)(?=^  [\w-]+:\n)', release.TEMPLATE, re.M | re.S)[1]
         self.assertIn('actions/cache/restore@', audit)
         self.assertNotRegex(audit, r'actions/cache@')
+
+    def test_ci_checks_out_only_declared_build_submodules(self):
+        self.assertNotIn('submodules: true', release.TEMPLATE)
+        self.assertEqual(release.TEMPLATE.count('run: python3 .release/deploy.py checkout-inputs'), 2)
+        urls = b'[submodule "public-library"]\npath = frontend/library\nurl = https://example.invalid/library\n'
+        (self.root / '.gitmodules').write_bytes(urls)
+        with patch.object(release, 'run', return_value=urls) as run, \
+                patch.object(release, 'git', return_value='160000 commit ' + 'a' * 40 + '\tfrontend/library'):
+            release.checkout_inputs(self.root, 'b' * 40, [])
+            run.assert_not_called()
+            release.checkout_inputs(self.root, 'b' * 40, ['frontend/library'])
+            self.assertEqual(run.call_args.args[0],
+                             ['git', '-C', self.root, 'submodule', 'update', '--init', '--checkout', '--', 'frontend/library'])
+        with patch.object(release, 'run', return_value=b'changed URLs'), self.assertRaisesRegex(ValueError, 'URLs'):
+            release.checkout_inputs(self.root, 'b' * 40, ['frontend/library'])
 
 
 class ConformTests(unittest.TestCase):
@@ -1057,7 +1079,7 @@ class BaseImageTests(unittest.TestCase):
     def test_the_template_is_the_only_release_workflow_and_calls_only_the_deploy_command(self):
         commands = re.findall(r'^\s+run: (.*)$', release.TEMPLATE, re.M)
         self.assertEqual({command.split()[2] for command in commands},
-                         {'status', 'verify', 'publish', 'refresh', 'audit', 'fix', 'apply-fix'})
+                         {'status', 'verify', 'publish', 'refresh', 'audit', 'fix', 'apply-fix', 'checkout-inputs'})
         self.assertTrue(all(command.startswith('python3 .release/deploy.py ') for command in commands))
         self.assertNotIn(release.LEGACY_CALLER, release.TEMPLATE)
 

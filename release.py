@@ -95,7 +95,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-          submodules: true
+      - name: Initialize declared build submodules
+        run: python3 .release/deploy.py checkout-inputs
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version-file: .nvmrc
@@ -160,7 +161,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-          submodules: true
+      - name: Initialize declared build submodules
+        run: python3 .release/deploy.py checkout-inputs
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version-file: .nvmrc
@@ -346,6 +348,20 @@ def unpack(data, destination):
         archive.extractall(destination, filter='data')
 
 
+def checkout_inputs(root, revision, submodules):
+    """Initialize only declared build inputs; private owner-data gitlinks stay outside CI."""
+    if not submodules:
+        return
+    if safe_path(root, '.gitmodules').read_bytes() != run(
+            ['git', '-C', root, 'show', revision + ':.gitmodules'], capture=True):
+        raise ValueError('Submodule URLs must match committed source')
+    for relative in submodules:
+        safe_path(root, relative)
+        if not git(root, 'ls-tree', revision, '--', relative).startswith('160000 commit '):
+            raise ValueError('Release submodule is not a committed Git link: ' + relative)
+    run(['git', '-C', root, 'submodule', 'update', '--init', '--checkout', '--', *submodules])
+
+
 def archive_source(root, revision, destination, submodules=(), inputs=()):
     excluded = ['.agents', '.claude', '.codex', '.gemini', '.mcp.json']
     paths = list(inputs) if inputs else ['.']
@@ -463,22 +479,29 @@ def toolchain(root, environment, project=None):
         raise ValueError('Pin npm or pnpm to an exact version')
     tools = CACHE / 'tools'
     tools.mkdir(parents=True, exist_ok=True)
-    # The registry's published integrity is the reference: the cached tarball is only a copy.
-    dist = json.loads(run(['npm', 'view', manager + '@' + version, 'dist.tarball', 'dist.integrity', '--json'],
-                          cwd=tools, env=environment, capture=True))
-    algorithm, _, expected = dist['dist.integrity'].partition('-')
-    if algorithm != 'sha512' or not dist['dist.tarball'].startswith('https://registry.npmjs.org/'):
-        raise ValueError(f'{manager}@{version} must come from the npm registry with a sha512 integrity')
-    tarball = verified_download(tools / f'{manager}-{version}.tgz', dist['dist.tarball'],
-                                lambda data: base64.b64encode(hashlib.sha512(data).digest()).decode() == expected)
-    # Reinstall from the verified tarball every time, so nothing in a restored install tree runs.
-    install = tools / (manager + '-' + version)
-    shutil.rmtree(install, ignore_errors=True)
-    install.mkdir()
-    (install / 'package.json').write_text(json.dumps({'private': True,
-        'allowScripts': {manager + '@' + version: True}}) + '\n')
-    run(['npm', 'install', '--prefix', install, '--offline', '--no-package-lock',
-         '--no-audit', '--no-fund', tarball], cwd=install, env=environment)
+    # Fresh registry metadata and a fresh dependency cache cannot inherit a poisoned restored cache. pnpm 12's
+    # platform executable is an optional package, so an offline tarball-only install is incomplete on clean CI.
+    with tempfile.TemporaryDirectory(prefix='app-manager-cache-') as cache:
+        bootstrap = {**environment, 'npm_config_cache': cache, 'npm_config_registry': 'https://registry.npmjs.org/',
+                     'npm_config_userconfig': os.devnull, 'npm_config_ignore_scripts': 'false'}
+        with urllib.request.urlopen(f'https://registry.npmjs.org/{manager}/{version}', timeout=60) as response:
+            metadata = json.load(response)
+        dist = metadata['dist']
+        algorithm, _, expected = dist['integrity'].partition('-')
+        if (metadata['name'] != manager or metadata['version'] != version or algorithm != 'sha512'
+                or not dist['tarball'].startswith('https://registry.npmjs.org/')):
+            raise ValueError(f'{manager}@{version} must come from the npm registry with a sha512 integrity')
+        tarball = verified_download(tools / f'{manager}-{version}.tgz', dist['tarball'],
+                                    lambda data: base64.b64encode(hashlib.sha512(data).digest()).decode() == expected)
+        # Reinstall from the verified tarball every time, so nothing in a restored install tree runs.
+        install = tools / (manager + '-' + version)
+        shutil.rmtree(install, ignore_errors=True)
+        install.mkdir()
+        # npm matches file-tarball script permissions by source, not by the package's self-reported name/version.
+        (install / 'package.json').write_text(json.dumps({'private': True,
+            'allowScripts': {'file:' + str(tarball): True}}) + '\n')
+        run(['npm', 'install', '--prefix', install, '--include=optional', '--no-package-lock',
+             '--strict-allow-scripts', '--no-audit', '--no-fund', tarball], cwd=install, env=bootstrap)
     executable = install / 'node_modules/.bin' / manager
     # Nested package scripts must use the same pinned manager.
     environment['PATH'] = str(install / 'node_modules/.bin') + os.pathsep + environment['PATH']
@@ -1420,7 +1443,7 @@ def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('operation', nargs='?', default='deploy', choices=[
-        'deploy', 'status', 'verify', 'publish', 'conform', 'audit', 'fix', 'apply-fix', 'refresh',
+        'deploy', 'status', 'verify', 'publish', 'conform', 'audit', 'fix', 'apply-fix', 'refresh', 'checkout-inputs',
         'template', 'adopt', 'scan-base', 'refresh-base', 'apply-base'])
     parser.add_argument('targets', nargs='*', type=Path, help='application roots for adopt')
     parser.add_argument('--root', type=Path, default=Path.cwd())
@@ -1458,6 +1481,8 @@ def main():
     if not pin or pin[1] != digest(Path(__file__)):
         raise ValueError('Publisher does not match the committed deploy command pin')
     config = json.loads(git(root, 'show', revision + ':.release/config.json'))
+    if options.operation == 'checkout-inputs':
+        return checkout_inputs(root, revision, config.get('submodules', []))
     if options.operation == 'audit':
         return audit(GitHub(), root, revision, config)
     repository = config['repository']
